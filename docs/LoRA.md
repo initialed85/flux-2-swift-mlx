@@ -107,6 +107,26 @@ This approach:
 - Adds minimal overhead (~76MB for rank-16 LoRAs; LoKr factors stay compact
   until each layer is merged)
 
+## Negative prompts
+
+Negative prompts are implemented with classical classifier-free guidance,
+which requires the non-distilled Klein base checkpoints. They are available in
+the CLI and pipeline APIs for `klein-4b-base` and `klein-9b-base` when guidance
+is greater than `1.0`; they are intentionally rejected for distilled Klein,
+Dev, and KV-cached models because those checkpoints use different guidance
+schemes.
+
+```bash
+flux2 t2i "a studio portrait of a person" \
+  --model klein-9b-base \
+  --negative-prompt "blurry, low resolution, distorted hands, text" \
+  --guidance 3.5
+```
+
+The negative text is encoded directly and is not prompt-upsampled or enriched
+by a VLM. CFG requires a conditional and negative transformer pass at every
+step, so expect roughly twice the denoising compute.
+
 ## Compatibility
 
 **Important:** LoRA files must match the model architecture:

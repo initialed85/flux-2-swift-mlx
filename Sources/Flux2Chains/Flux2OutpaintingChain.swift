@@ -54,8 +54,14 @@ public struct Flux2OutpaintingChain: Flux2Chain {
     /// Action + Style + Context*, 30–80 words, leading words weigh more.
     /// Mention the content of the keep region too — the transformer
     /// attends to the I2I reference but the prompt is still its main
-    /// steering signal. No negative prompts.
+    /// steering signal. Use ``negativePrompt`` only with a non-distilled
+    /// Klein base pipeline running classical CFG.
     public let prompt: String
+
+    /// Optional negative conditioning text. This requires a non-distilled
+    /// Klein base pipeline with classical CFG; distilled Klein and Dev do not
+    /// support negative-prompt guidance.
+    public let negativePrompt: String?
 
     /// FLUX.2 generation parameters. Defaults target distilled klein.
     public let steps: Int
@@ -116,6 +122,8 @@ public struct Flux2OutpaintingChain: Flux2Chain {
     ///     content of the keep region too — the I2I reference gives the
     ///     transformer visual anchoring, but the prompt is still its main
     ///     steering signal.
+    ///   - negativePrompt: Optional negative conditioning text. Requires a
+    ///     non-distilled Klein base pipeline and guidance greater than 1.
     ///   - steps: Denoising step count. `4` matches klein distilled defaults.
     ///   - guidance: Classifier-free guidance scale.
     ///   - seed: Random seed for reproducibility. `nil` for non-deterministic.
@@ -141,6 +149,7 @@ public struct Flux2OutpaintingChain: Flux2Chain {
         left: Int = 0,
         right: Int = 0,
         prompt: String,
+        negativePrompt: String? = nil,
         steps: Int = 4,
         guidance: Float = 1.0,
         seed: UInt64? = nil,
@@ -157,6 +166,7 @@ public struct Flux2OutpaintingChain: Flux2Chain {
         self.left = left
         self.right = right
         self.prompt = prompt
+        self.negativePrompt = negativePrompt
         self.steps = steps
         self.guidance = guidance
         self.seed = seed
@@ -249,6 +259,7 @@ public struct Flux2OutpaintingChain: Flux2Chain {
         let inpaint = Flux2MaskedInpaintingChain(
             pipeline: pipeline,
             prompt: resolvedPrompt,
+            negativePrompt: negativePrompt,
             image: canvas,
             mask: mask,
             referenceImages: [image],  // I2I conditioning continues the scene

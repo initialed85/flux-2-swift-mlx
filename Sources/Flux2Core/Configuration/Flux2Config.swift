@@ -169,8 +169,9 @@ public enum Flux2Model: String, CaseIterable, Sendable {
     }
 
     /// Whether this model expects **classical CFG** at inference time —
-    /// i.e. two transformer passes per step (cond + uncond with empty
-    /// negative prompt) combined as `uncond + guidance * (cond - uncond)`.
+    /// i.e. two transformer passes per step (cond + uncond, optionally using
+    /// a user-supplied negative prompt) combined as
+    /// `uncond + guidance * (cond - uncond)`.
     ///
     /// - `klein4BBase` / `klein9BBase`: ✅ true. These are *non-distilled*
     ///   models. Their attention behaviour and any LoRA trained against
@@ -179,7 +180,8 @@ public enum Flux2Model: String, CaseIterable, Sendable {
     ///   plausible output but cannot follow conditioning that wasn't
     ///   trivially copyable from the references (e.g. camera deltas).
     ///   Matches diffusers' `Flux2KleinPipeline` which uses
-    ///   `negative_prompt = ""` and `guidance_scale = 4.0` by default.
+    ///   `negative_prompt = ""` and `guidance_scale = 4.0` by default;
+    ///   callers may provide non-empty negative text through the pipeline API.
     ///
     /// - All others: ❌ false. `dev` uses embedded-guidance (a single
     ///   transformer pass with a guidance tensor); the distilled / KV

@@ -36,6 +36,9 @@ struct Outpaint: AsyncParsableCommand {
     @Option(name: [.short, .long], help: "Text prompt describing the full extended scene. Follow Flux 2 prompting guidelines (https://docs.bfl.ml/guides/prompting_guide_flux2): Subject + Action + Style + Context, 30–80 words, mention the content of the keep region too.")
     var prompt: String
 
+    @Option(name: .long, help: "Negative prompt for classical CFG (requires klein-4b-base or klein-9b-base)")
+    var negativePrompt: String?
+
     @Option(name: [.short, .long], help: "Output PNG path.")
     var output: String
 
@@ -94,6 +97,7 @@ struct Outpaint: AsyncParsableCommand {
         logErr("Prompt: \(prompt)")
 
         let modelChoice = try Flux2Model.parseCLI(fluxModel)
+        try validateNegativePrompt(negativePrompt, model: modelChoice, guidance: guidance)
         let promptUpsampler = try parsePromptUpsampler(upsampleModel, path: upsampleModelPath)
 
         if enrichPromptWithVLM {
@@ -124,6 +128,7 @@ struct Outpaint: AsyncParsableCommand {
             left: left,
             right: right,
             prompt: prompt,
+            negativePrompt: negativePrompt,
             steps: steps,
             guidance: guidance,
             seed: seed,

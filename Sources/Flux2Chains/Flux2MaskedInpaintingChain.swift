@@ -28,8 +28,9 @@ public struct Flux2MaskedInpaintingChain: Flux2Chain {
 
     /// Text describing the **full** target image, **not** just the edit.
     ///
-    /// FLUX.2 has no negative prompts and no dedicated edit instruction
-    /// channel — the prompt is the only steering signal for the in-mask
+    /// Distilled FLUX.2 checkpoints have no negative-prompt channel and no
+    /// dedicated edit instruction channel — the prompt is the only steering
+    /// signal for the in-mask
     /// region. Follow the BFL prompting guidelines
     /// (<https://docs.bfl.ml/guides/prompting_guide_flux2>):
     ///
@@ -38,7 +39,9 @@ public struct Flux2MaskedInpaintingChain: Flux2Chain {
     /// - **Length**: ~30–80 words. Describe the **whole** scene including
     ///   the kept surroundings so the model has lighting/perspective cues
     ///   for the inpainted region.
-    /// - **No negatives**: describe what you want, never what to avoid.
+    /// - For distilled checkpoints, describe what you want rather than what
+    ///   to avoid. Non-distilled Klein base models can use ``negativePrompt``
+    ///   with classical CFG.
     ///
     /// Short prompts like `"a duck"` give the model no spatial / lighting /
     /// integration cues and produce floating, mismatched subjects. Prefer:
@@ -50,6 +53,12 @@ public struct Flux2MaskedInpaintingChain: Flux2Chain {
     /// For dynamic prompt expansion at inference time, set
     /// ``upsamplePrompt`` to `true`.
     public let prompt: String
+
+    /// Optional negative conditioning text. This is only supported when the
+    /// underlying pipeline uses a non-distilled Klein base model with
+    /// classical CFG; distilled Klein and Dev checkpoints have no equivalent
+    /// negative-prompt path.
+    public let negativePrompt: String?
     public let image: CGImage
     /// Mask image, same dimensions as `image` (resized otherwise). What
     /// "mask" means depends on ``maskConvention``:
@@ -195,6 +204,8 @@ public struct Flux2MaskedInpaintingChain: Flux2Chain {
     ///     LoRA *before* calling `run()` (or `run()` will load them lazily).
     ///   - prompt: Text describing the desired full image. The model
     ///     regenerates everything; the mask just forces the original back
+    ///   - negativePrompt: Optional negative conditioning text. Requires a
+    ///     non-distilled Klein base pipeline and guidance greater than 1.
     ///     outside the painted region.
     ///   - image: Source image. Pixels under the *black* part of the mask are
     ///     preserved bit-exact by the RePaint blend.
@@ -250,6 +261,7 @@ public struct Flux2MaskedInpaintingChain: Flux2Chain {
     public init(
         pipeline: Flux2Pipeline,
         prompt: String,
+        negativePrompt: String? = nil,
         image: CGImage,
         mask: CGImage,
         maskConvention: Flux2MaskConvention = .grayscaleWhiteInpaint,
@@ -269,6 +281,7 @@ public struct Flux2MaskedInpaintingChain: Flux2Chain {
     ) {
         self.pipeline = pipeline
         self.prompt = prompt
+        self.negativePrompt = negativePrompt
         self.image = image
         self.mask = mask
         self.maskConvention = maskConvention
@@ -415,6 +428,7 @@ public struct Flux2MaskedInpaintingChain: Flux2Chain {
         let result = try await pipeline.generateWithResult(
             mode: mode,
             prompt: resolvedPrompt,
+            negativePrompt: negativePrompt,
             interpretImagePaths: nil,
             height: targetH,
             width: targetW,

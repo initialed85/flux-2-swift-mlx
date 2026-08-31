@@ -37,6 +37,7 @@ flux2 t2i <prompt> [options]
 | `--model` | | `dev` | Model variant: `dev` (32B), `klein-4b` (4B), `klein-9b` (9B) |
 | `--steps` | `-s` | varies* | Number of inference steps |
 | `--guidance` | `-g` | varies* | Guidance scale (CFG) |
+| `--negative-prompt` | none | none | Negative conditioning text; requires a non-distilled Klein base model (`klein-4b-base` or `klein-9b-base`) and guidance > 1 |
 | `--seed` | | random | Random seed for reproducibility |
 | `--text-quant` | | `8bit` | Text encoder quantization: `bf16`, `8bit`, `6bit`, `4bit` |
 | `--transformer-quant` | | `qint8` | Transformer quantization: `bf16`, `qint8`, `int4`, `mxfp8`, `mxfp4`, `nvfp4` |
@@ -524,6 +525,27 @@ flux2 t2i "a mountain landscape" \
   --model dev \
   -o output.png
 ```
+
+### Negative prompts
+
+FLUX.2's distilled Klein checkpoints and Dev checkpoint do not implement the
+classic unconditional/conditional pair needed for a negative prompt. The CLI
+therefore accepts `--negative-prompt` only with the non-distilled Klein base
+models, which run classical CFG:
+
+```bash
+flux2 t2i "a studio portrait of a person" \
+  --model klein-9b-base \
+  --negative-prompt "blurry, low resolution, distorted hands, text" \
+  --guidance 3.5 \
+  -o portrait.png
+```
+
+A negative prompt adds a second transformer pass per denoising step. It is
+encoded verbatim (it is not sent through prompt upsampling or image-aware VLM
+enrichment). Supplying it with a distilled model, Dev, or guidance `<= 1`
+is rejected rather than silently producing an ineffective result. For those
+models, phrase the desired result positively instead.
 
 For complete LoRA documentation, examples, and troubleshooting, see **[LoRA.md](LoRA.md)**.
 

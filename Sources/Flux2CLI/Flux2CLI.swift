@@ -82,6 +82,28 @@ private func loadLoRAConfigs(
     return try fileSpecs.map { try parseLoRAFileSpec($0, defaultScale: defaultScale) }
 }
 
+/// Validate the negative-prompt combination before loading large models.
+/// Classical CFG is only meaningful for the non-distilled Klein base
+/// checkpoints; distilled Klein and Dev use different guidance mechanisms.
+func validateNegativePrompt(
+    _ negativePrompt: String?,
+    model: Flux2Model,
+    guidance: Float
+) throws {
+    guard let negativePrompt,
+          !negativePrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+        return
+    }
+    guard model.usesClassicalCFG else {
+        throw ValidationError(
+            "--negative-prompt requires a non-distilled Klein base model (klein-4b-base or klein-9b-base); \(model.displayName) does not support classical negative-prompt CFG")
+    }
+    guard guidance > 1.0 else {
+        throw ValidationError(
+            "--negative-prompt requires --guidance greater than 1.0 so classifier-free guidance is active (received \(guidance))")
+    }
+}
+
 func parsePromptUpsampler(
     _ value: String,
     path: String?
@@ -137,6 +159,9 @@ struct TextToImage: AsyncParsableCommand {
 
     @Argument(help: "Text prompt for image generation")
     var prompt: String
+
+    @Option(name: .long, help: "Negative prompt for classical CFG (requires klein-4b-base or klein-9b-base)")
+    var negativePrompt: String?
 
     @Option(name: .shortAndLong, help: "Output file path")
     var output: String = "output.png"
@@ -266,6 +291,7 @@ struct TextToImage: AsyncParsableCommand {
         // Priority: CLI flag > LoRA override > model default
         actualSteps = steps ?? loraOverrides?.numSteps ?? modelVariant.defaultSteps
         actualGuidance = guidance ?? loraOverrides?.guidance ?? modelVariant.defaultGuidance
+        try validateNegativePrompt(negativePrompt, model: modelVariant, guidance: actualGuidance)
 
         // Parse quantization settings
         guard let textQuantization = MistralQuantization(rawValue: textQuant) else {
@@ -310,6 +336,9 @@ struct TextToImage: AsyncParsableCommand {
         print("Generating \(width)x\(height), \(actualSteps) steps, guidance \(actualGuidance)\(seed.map { ", seed \($0)" } ?? "")...")
         if verbose {
             print("  Prompt: \"\(prompt)\"")
+            if let negativePrompt, !negativePrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                print("  Negative prompt: \"\(negativePrompt)\"")
+            }
             if !interpretImagePaths.isEmpty {
                 print("  Interpret images: \(interpretImagePaths.count) (VLM will analyze and enrich prompt)")
                 for path in interpretImagePaths {
@@ -417,6 +446,7 @@ struct TextToImage: AsyncParsableCommand {
 
         let image = try await pipeline.generateTextToImage(
             prompt: prompt,
+            negativePrompt: negativePrompt,
             interpretImagePaths: interpretImagePaths.isEmpty ? nil : interpretImagePaths,
             height: height,
             width: width,
@@ -462,6 +492,9 @@ struct ImageToImage: AsyncParsableCommand {
 
     @Argument(help: "Text prompt describing the desired output")
     var prompt: String
+
+    @Option(name: .long, help: "Negative prompt for classical CFG (requires klein-4b-base or klein-9b-base)")
+    var negativePrompt: String?
 
     @Option(name: .shortAndLong, help: "Reference image for visual conditioning")
     var images: [String]
@@ -593,6 +626,7 @@ struct ImageToImage: AsyncParsableCommand {
         // Priority: CLI flag > LoRA override > model default
         actualSteps = steps ?? loraOverrides?.numSteps ?? modelVariant.defaultSteps
         actualGuidance = guidance ?? loraOverrides?.guidance ?? modelVariant.defaultGuidance
+        try validateNegativePrompt(negativePrompt, model: modelVariant, guidance: actualGuidance)
 
         // Validate image count (model-specific limit)
         let maxImages = modelVariant.maxReferenceImages
@@ -640,6 +674,9 @@ struct ImageToImage: AsyncParsableCommand {
         print("I2I \(outputWidth)x\(outputHeight), \(actualSteps) steps, guidance \(actualGuidance), \(refImages.count) ref image(s)\(seed.map { ", seed \($0)" } ?? "")...")
         if verbose {
             print("  Prompt: \"\(prompt)\"")
+            if let negativePrompt, !negativePrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                print("  Negative prompt: \"\(negativePrompt)\"")
+            }
             if upsamplePrompt {
                 print("  Prompt upsampling: enabled")
                 print("  Prompt upsampler: \(promptUpsampler.model.displayName)\(promptUpsampler.path.map { " [\($0.path)]" } ?? "")")
@@ -748,6 +785,7 @@ struct ImageToImage: AsyncParsableCommand {
         let image = try await pipeline.generateImageToImage(
             prompt: prompt,
             images: refImages,
+            negativePrompt: negativePrompt,
             interpretImagePaths: interpretImagePaths.isEmpty ? nil : interpretImagePaths,
             height: height,
             width: width,

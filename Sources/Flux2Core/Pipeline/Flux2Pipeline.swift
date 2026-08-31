@@ -971,6 +971,8 @@ public class Flux2Pipeline: @unchecked Sendable {
     /// Generate image from text prompt
     /// - Parameters:
     ///   - prompt: Text description of the image
+    ///   - negativePrompt: Optional negative conditioning text. Supported by
+    ///     non-distilled Klein base models using classical CFG.
     ///   - height: Image height (default 1024)
     ///   - width: Image width (default 1024)
     ///   - steps: Number of denoising steps (default 50)
@@ -983,6 +985,7 @@ public class Flux2Pipeline: @unchecked Sendable {
     /// - Returns: Generated image
     public func generateTextToImage(
         prompt: String,
+        negativePrompt: String? = nil,
         interpretImagePaths: [String]? = nil,
         height: Int = 1024,
         width: Int = 1024,
@@ -998,6 +1001,7 @@ public class Flux2Pipeline: @unchecked Sendable {
         try await generate(
             mode: .textToImage,
             prompt: prompt,
+            negativePrompt: negativePrompt,
             interpretImagePaths: interpretImagePaths,
             height: height,
             width: width,
@@ -1019,6 +1023,8 @@ public class Flux2Pipeline: @unchecked Sendable {
     ///
     /// - Parameters:
     ///   - prompt: Text description
+    ///   - negativePrompt: Optional negative conditioning text. Supported by
+    ///     non-distilled Klein base models using classical CFG.
     ///   - images: 1-3 reference images. Multiple images are concatenated along sequence dimension
     ///             with unique time-based position IDs, allowing the transformer to attend to all references.
     ///   - interpretImagePaths: File paths to images to analyze with VLM and inject description into prompt (not used as visual reference)
@@ -1035,6 +1041,7 @@ public class Flux2Pipeline: @unchecked Sendable {
     public func generateImageToImage(
         prompt: String,
         images: [CGImage],
+        negativePrompt: String? = nil,
         interpretImagePaths: [String]? = nil,
         height: Int? = nil,
         width: Int? = nil,
@@ -1058,6 +1065,7 @@ public class Flux2Pipeline: @unchecked Sendable {
         return try await generate(
             mode: .imageToImage(images: images),
             prompt: prompt,
+            negativePrompt: negativePrompt,
             interpretImagePaths: interpretImagePaths,
             height: targetHeight,
             width: targetWidth,
@@ -1078,6 +1086,7 @@ public class Flux2Pipeline: @unchecked Sendable {
     public func generateImageToImage(
         prompt: String,
         imageData: [Data],
+        negativePrompt: String? = nil,
         interpretImagePaths: [String]? = nil,
         height: Int? = nil,
         width: Int? = nil,
@@ -1099,6 +1108,7 @@ public class Flux2Pipeline: @unchecked Sendable {
         return try await generateImageToImage(
             prompt: prompt,
             images: images,
+            negativePrompt: negativePrompt,
             interpretImagePaths: interpretImagePaths,
             height: height,
             width: width,
@@ -1116,9 +1126,12 @@ public class Flux2Pipeline: @unchecked Sendable {
     // MARK: - Generation with Result (includes used prompt)
 
     /// Generate an image from text with full result including the used prompt
+    /// - Parameter negativePrompt: Optional negative conditioning text for
+    ///   classical CFG on non-distilled Klein base models.
     /// - Returns: Flux2GenerationResult containing image and prompt metadata
     public func generateTextToImageWithResult(
         prompt: String,
+        negativePrompt: String? = nil,
         interpretImagePaths: [String]? = nil,
         height: Int = 1024,
         width: Int = 1024,
@@ -1133,6 +1146,7 @@ public class Flux2Pipeline: @unchecked Sendable {
         try await generateWithResult(
             mode: .textToImage,
             prompt: prompt,
+            negativePrompt: negativePrompt,
             interpretImagePaths: interpretImagePaths,
             height: height,
             width: width,
@@ -1151,6 +1165,7 @@ public class Flux2Pipeline: @unchecked Sendable {
     public func generateImageToImageWithResult(
         prompt: String,
         images: [CGImage],
+        negativePrompt: String? = nil,
         interpretImagePaths: [String]? = nil,
         height: Int? = nil,
         width: Int? = nil,
@@ -1174,6 +1189,7 @@ public class Flux2Pipeline: @unchecked Sendable {
         return try await generateWithResult(
             mode: .imageToImage(images: images),
             prompt: prompt,
+            negativePrompt: negativePrompt,
             interpretImagePaths: interpretImagePaths,
             height: targetHeight,
             width: targetWidth,
@@ -1194,6 +1210,7 @@ public class Flux2Pipeline: @unchecked Sendable {
     public func generateImageToImageWithResult(
         prompt: String,
         imageData: [Data],
+        negativePrompt: String? = nil,
         interpretImagePaths: [String]? = nil,
         height: Int? = nil,
         width: Int? = nil,
@@ -1215,6 +1232,7 @@ public class Flux2Pipeline: @unchecked Sendable {
         return try await generateImageToImageWithResult(
             prompt: prompt,
             images: images,
+            negativePrompt: negativePrompt,
             interpretImagePaths: interpretImagePaths,
             height: height,
             width: width,
@@ -1233,6 +1251,7 @@ public class Flux2Pipeline: @unchecked Sendable {
     public func generate(
         mode: Flux2GenerationMode,
         prompt: String,
+        negativePrompt: String? = nil,
         interpretImagePaths: [String]? = nil,
         height: Int,
         width: Int,
@@ -1250,6 +1269,7 @@ public class Flux2Pipeline: @unchecked Sendable {
         let result = try await generateWithResult(
             mode: mode,
             prompt: prompt,
+            negativePrompt: negativePrompt,
             interpretImagePaths: interpretImagePaths,
             height: height,
             width: width,
@@ -1269,6 +1289,9 @@ public class Flux2Pipeline: @unchecked Sendable {
 
     /// Unified generation method with full result including used prompt
     ///
+    /// - Parameter negativePrompt: Optional negative conditioning text. It is
+    ///   encoded verbatim and used for the unconditional CFG pass on
+    ///   non-distilled Klein base models.
     /// - Parameter maxReferencePixels: I2I only — per-reference-image VAE encode
     ///   budget in pixels (see ``encodeReferenceImages``). Ignored for text-to-image.
     ///   Defaults to the historical 1024² budget.
@@ -1287,6 +1310,7 @@ public class Flux2Pipeline: @unchecked Sendable {
     public func generateWithResult(
         mode: Flux2GenerationMode,
         prompt: String,
+        negativePrompt: String? = nil,
         interpretImagePaths: [String]? = nil,
         height: Int,
         width: Int,
@@ -1322,6 +1346,28 @@ public class Flux2Pipeline: @unchecked Sendable {
             width: width
         )
 
+        // FLUX.2 only has a principled negative-prompt path for the
+        // non-distilled Klein base checkpoints, which are trained for
+        // classical classifier-free guidance (two transformer passes).
+        // Distilled Klein and Dev use different guidance mechanisms and must
+        // not silently pretend that a second negative pass is equivalent.
+        let normalizedNegativePrompt = negativePrompt?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let hasNegativePrompt = !(normalizedNegativePrompt?.isEmpty ?? true)
+        if hasNegativePrompt {
+            guard model.usesClassicalCFG else {
+                throw Flux2Error.invalidConfiguration(
+                    "Negative prompts require a non-distilled Klein base model (klein-4b-base or klein-9b-base); \(model.displayName) was not trained for classical negative-prompt CFG")
+            }
+            guard guidance > 1.0 else {
+                throw Flux2Error.invalidConfiguration(
+                    "Negative prompts require guidance > 1.0 so classifier-free guidance is active (received \(guidance))")
+            }
+            guard precomputedEmbeddings == nil else {
+                throw Flux2Error.invalidConfiguration(
+                    "Negative prompts require text encoding; precomputedEmbeddings cannot be used unless negative embeddings are supplied separately")
+            }
+        }
+
         // Check image size feasibility
         let sizeCheck = memoryManager.checkImageSize(width: validWidth, height: validHeight)
         if case .insufficientMemory = sizeCheck {
@@ -1353,8 +1399,9 @@ public class Flux2Pipeline: @unchecked Sendable {
         var finalUsedPrompt: String = prompt
         var wasPromptUpsampled: Bool = false
 
-        // Classical CFG (klein base only): cache an empty-prompt embedding to
-        // run the transformer twice per step. Skipped at guidance ≤ 1.
+        // Classical CFG (Klein base only): cache the negative-prompt
+        // embedding to run the transformer twice per step. With no explicit
+        // negative prompt this preserves the historical empty-prompt path.
         let useClassicalCFG = model.usesClassicalCFG && guidance > 1.0
         var negativeTextEmbeddings: MLXArray? = nil
 
@@ -1530,17 +1577,24 @@ public class Flux2Pipeline: @unchecked Sendable {
             }
             eval(textEmbeddings)
 
-            // Classical CFG: encode the empty negative prompt with the same
-            // encoder before unloading. Stored separately and consumed in the
-            // denoising loop's uncond pass.
+            // Classical CFG: encode the supplied negative prompt with the
+            // same encoder before unloading. An empty string preserves the
+            // historical unconditional path when no negative was supplied.
             if useClassicalCFG {
-                Flux2Debug.log("Classical CFG enabled — encoding empty negative prompt")
+                let negativeText = normalizedNegativePrompt ?? ""
+                Flux2Debug.log(
+                    negativeText.isEmpty
+                        ? "Classical CFG enabled — encoding empty negative prompt"
+                        : "Classical CFG enabled — encoding negative prompt")
                 let negEmbeds: MLXArray
                 switch model {
                 case .dev:
-                    negEmbeds = try textEncoder!.encode("", upsample: false)
+                    // This branch is unreachable because Dev does not use
+                    // classical CFG, but keeping the switch exhaustive makes
+                    // the encoder choice explicit.
+                    negEmbeds = try textEncoder!.encode(negativeText, upsample: false)
                 case .klein4B, .klein4BBase, .klein9B, .klein9BBase, .klein9BKV:
-                    negEmbeds = try kleinEncoder!.encode("", upsample: false)
+                    negEmbeds = try kleinEncoder!.encode(negativeText, upsample: false)
                 }
                 eval(negEmbeds)
                 negativeTextEmbeddings = negEmbeds

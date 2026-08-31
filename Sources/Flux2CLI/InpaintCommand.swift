@@ -77,6 +77,9 @@ struct Inpaint: AsyncParsableCommand {
     @Option(name: [.short, .long], help: "Text prompt describing the desired full image. Follow Flux 2 prompting guidelines (https://docs.bfl.ml/guides/prompting_guide_flux2): Subject + Action + Style + Context, 30–80 words, describe the WHOLE scene including the kept surroundings (the model has no other lighting / perspective cues for the inpainted region).")
     var prompt: String
 
+    @Option(name: .long, help: "Negative prompt for classical CFG (requires klein-4b-base or klein-9b-base)")
+    var negativePrompt: String?
+
     @Option(name: [.short, .long], help: "Output PNG path.")
     var output: String
 
@@ -161,6 +164,7 @@ struct Inpaint: AsyncParsableCommand {
         logErr("Prompt: \(prompt)")
 
         let modelChoice = try Flux2Model.parseCLI(fluxModel)
+        try validateNegativePrompt(negativePrompt, model: modelChoice, guidance: guidance)
         let promptUpsampler = try parsePromptUpsampler(upsampleModel, path: upsampleModelPath)
 
         // Optional VLM load — only relevant when the user opts into
@@ -213,6 +217,7 @@ struct Inpaint: AsyncParsableCommand {
         let chain = Flux2MaskedInpaintingChain(
             pipeline: pipeline,
             prompt: prompt,
+            negativePrompt: negativePrompt,
             image: imageCG,
             mask: maskCG,
             maskConvention: maskConvention.convention,
