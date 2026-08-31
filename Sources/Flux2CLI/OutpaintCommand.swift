@@ -57,6 +57,12 @@ struct Outpaint: AsyncParsableCommand {
     @Flag(name: .long, help: "Text-encoder-only prompt rewriting (Mistral/Klein-Qwen3). Does NOT look at the image. For image-aware rewriting that continues the source's lighting/materials into the new strips, use --enrich-prompt-with-vlm instead.")
     var upsamplePrompt: Bool = false
 
+    @Option(name: .long, help: "Prompt upsampler model: auto (default), mistral, or qwen3")
+    var upsampleModel: String = "auto"
+
+    @Option(name: .long, help: "Local model directory for --upsample-model (Mistral or Qwen3)")
+    var upsampleModelPath: String?
+
     @Flag(name: .long, help: "Image-aware prompt rewriting via a VLM (--vlm-provider: bundled Qwen3.5 by default, or Gemma 4 E2B). The VLM looks at --image and the requested extension sides, then assembles a 30-80 word BFL-style Flux 2 prompt that continues the kept region's materials, perspective, lighting and palette into the new strips. Strictly optional: if no VLM is loaded, the chain falls back to --prompt verbatim with a warning. Pass --qwen35-variant/--qwen35-path (or --gemma4-variant/--gemma4-path) to have this command load one in-process. When both --upsample-prompt and --enrich-prompt-with-vlm are set, the VLM wins.")
     var enrichPromptWithVLM: Bool = false
 
@@ -88,6 +94,7 @@ struct Outpaint: AsyncParsableCommand {
         logErr("Prompt: \(prompt)")
 
         let modelChoice = try Flux2Model.parseCLI(fluxModel)
+        let promptUpsampler = try parsePromptUpsampler(upsampleModel, path: upsampleModelPath)
 
         if enrichPromptWithVLM {
             // Surface the VLM-built prompt so the user can audit what FLUX.2
@@ -103,6 +110,8 @@ struct Outpaint: AsyncParsableCommand {
             quantization: .memoryEfficient,
             vaeVariant: .smallDecoder
         )
+        pipeline.promptUpsampler = promptUpsampler.model
+        pipeline.promptUpsamplerPath = promptUpsampler.path
         let loadStart = Date()
         try await pipeline.loadModels()
         logErr("✓ Flux2 pipeline ready in \(String(format: "%.1fs", Date().timeIntervalSince(loadStart)))")

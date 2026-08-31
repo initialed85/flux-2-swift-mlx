@@ -8,6 +8,22 @@
 import ArgumentParser
 import Flux2Core
 
+extension Flux2PromptUpsampler {
+    /// All accepted CLI values, derived from the enum's raw values.
+    static var cliValueList: String {
+        allCases.map(\.rawValue).joined(separator: " | ")
+    }
+
+    /// Parse the prompt upsampler selection.
+    static func parseCLI(_ value: String) throws -> Flux2PromptUpsampler {
+        let lowered = value.lowercased()
+        guard let parsed = Flux2PromptUpsampler(rawValue: lowered) else {
+            throw ValidationError("Unsupported --upsample-model '\(value)'. Use: \(cliValueList)")
+        }
+        return parsed
+    }
+}
+
 extension Flux2Model {
     /// All accepted CLI values, derived from the enum raw values.
     static var cliValueList: String {

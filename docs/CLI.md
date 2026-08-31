@@ -41,6 +41,8 @@ flux2 t2i <prompt> [options]
 | `--text-quant` | | `8bit` | Text encoder quantization: `bf16`, `8bit`, `6bit`, `4bit` |
 | `--transformer-quant` | | `qint8` | Transformer quantization: `bf16`, `qint8`, `int4`, `mxfp8`, `mxfp4`, `nvfp4` |
 | `--upsample-prompt` | | | Enhance prompt with visual details before encoding |
+| `--upsample-model` | | `auto` | Prompt rewriter: `auto`, `mistral`, or `qwen3` |
+| `--upsample-model-path` | | | Local Mistral/Qwen3 model directory for prompt rewriting |
 | `--interpret` | | | Image to analyze with VLM and inject into prompt (all models) |
 | `--checkpoint` | | | Save intermediate images every N steps |
 | `--models-dir` | | | Custom models directory (for sandboxed apps or custom storage) |
@@ -222,7 +224,9 @@ flux2 i2i <prompt> --images <img1> --images <img2> [--images <img3>] [options]
 | `--strength` | | `0.8` | Denoising strength (0.0-1.0). Lower = preserve more original |
 | `--guidance` | `-g` | `4.0` | Guidance scale |
 | `--seed` | | random | Random seed |
-| `--upsample-prompt` | | false | Enhance prompt with Mistral before encoding |
+| `--upsample-prompt` | | false | Enhance prompt with the selected prompt rewriter before encoding |
+| `--upsample-model` | | `auto` | Prompt rewriter: `auto`, `mistral`, or `qwen3` |
+| `--upsample-model-path` | | | Local Mistral/Qwen3 model directory for prompt rewriting |
 | `--checkpoint` | | | Save intermediate images every N steps |
 | `--models-dir` | | | Custom models directory (for sandboxed apps or custom storage) |
 | `--profile` | | false | Show detailed performance profiling |
@@ -357,10 +361,17 @@ Reference images consume tokens in the transformer's attention. Here are practic
 
 | Model | T2I Upsampling | I2I Upsampling |
 |-------|----------------|----------------|
-| **Dev** | Mistral VLM (text) | Mistral VLM (sees images) ✅ |
+| **Dev** | Mistral (text) | Mistral VLM (sees images) ✅ |
 | **Klein** | Qwen3 (text only) | **Mistral VLM (sees images)** ✅ |
 
-> **Note:** For Klein I2I with `--upsample-prompt`, the pipeline automatically loads Mistral VLM temporarily to analyze reference images, then unloads it and uses Qwen3 for the final text encoding. This matches the official Flux.2 implementation and provides context-aware upsampling.
+Use `--upsample-model mistral` or `--upsample-model qwen3` to override the
+text-only rewriter. Add `--upsample-model-path PATH` to load a local model
+(the path must contain the matching tokenizer and safetensors files). An
+explicit override on I2I selects text-only rewriting, so reference images are
+not passed to that rewriter; omit it to retain the automatic image-aware VLM
+path. For Klein I2I with automatic upsampling, the pipeline temporarily loads
+Mistral VLM to analyze reference images, then unloads it and uses Qwen3 for the
+final text encoding.
 
 ---
 
@@ -450,9 +461,9 @@ Apply LoRA (Low-Rank Adaptation) weights to customize model behavior for specifi
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--lora` | none | Path to LoRA safetensors file |
-| `--lora-scale` | `1.0` | LoRA scale factor (typically 0.5-1.5) |
-| `--lora-config` | none | JSON config file (for advanced LoRAs with scheduler overrides) |
+| `--lora` | none | LoRA safetensors file; repeat for multiple adapters, optionally append `:SCALE` |
+| `--lora-scale` | `1.0` | Default scale for `--lora` specs without an inline scale |
+| `--lora-config` | none | JSON config file; repeat for multiple adapters (alternative to `--lora`) |
 
 **Quick example:**
 ```bash
@@ -463,6 +474,48 @@ flux2 i2i "2x2 sprite sheet" \
   --model klein-4b \
   -o spritesheet.png
 ```
+
+**Stacked adapters:**
+```bash
+flux2 t2i "a cinematic character portrait" \
+  --model klein-9b \
+  --lora style.safetensors:0.7 \
+  --lora character.safetensors:0.85 \
+  -o portrait.png
+```
+
+Repeat `--lora-config` instead when each adapter needs its own activation
+keyword or scheduler settings. Do not mix `--lora` and `--lora-config` in the
+same command.
+
+### Prompt upsampler override
+
+`--upsample-prompt` uses the image model's normal text encoder by default for
+text-to-image (`Mistral` for Dev, `Qwen3` for Klein). Override that rewriter
+without changing the image model:
+
+```bash
+flux2 t2i "a portrait of a person" \
+  --model klein-9b \
+  --upsample-prompt \
+  --upsample-model mistral \
+  -o portrait.png
+```
+
+To use a local alternate checkpoint, add its model directory:
+
+```bash
+flux2 t2i "a portrait of a person" \
+  --model klein-9b \
+  --upsample-prompt \
+  --upsample-model mistral \
+  --upsample-model-path /path/to/mistral-model \
+  -o portrait.png
+```
+
+The local directory must match the selected type (`Mistral` or `Qwen3`). On
+I2I/inpainting/outpainting, an explicit override uses text-only rewriting;
+`--upsample-model auto` retains the existing image-aware Mistral VLM path.
 
 **With JSON config (for Turbo LoRAs):**
 ```bash

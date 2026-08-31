@@ -17,6 +17,87 @@ func configureModelsDirectory(_ path: String?) {
     TextEncoderModelDownloader.reconfigureHubApi()
 }
 
+/// Parse repeatable CLI LoRA arguments.
+///
+/// A file spec may optionally end in `:scale`, for example
+/// `/models/style.safetensors:0.7`. A path without an inline scale uses the
+/// command's `--lora-scale` value. JSON configs keep their own scale and
+/// metadata, so they are handled separately below.
+private func parseLoRAFileSpec(_ spec: String, defaultScale: Float) throws -> LoRAConfig {
+    var path = spec
+    var scale = defaultScale
+
+    if let separator = spec.lastIndex(of: ":"), separator != spec.startIndex {
+        let scaleText = String(spec[spec.index(after: separator)...])
+        guard let inlineScale = Float(scaleText), inlineScale.isFinite else {
+            throw ValidationError("Invalid LoRA scale in '\(spec)'. Use PATH or PATH:SCALE, e.g. style.safetensors:0.7")
+        }
+        path = String(spec[..<separator])
+        scale = inlineScale
+    }
+
+    guard !path.isEmpty else {
+        throw ValidationError("LoRA path cannot be empty")
+    }
+    guard FileManager.default.fileExists(atPath: path) else {
+        throw ValidationError("LoRA file not found: \(path)")
+    }
+
+    return LoRAConfig(filePath: path, scale: scale)
+}
+
+/// Build all LoRA configs for a generation command. Raw files and JSON
+/// configs are intentionally mutually exclusive so scale and scheduler
+/// precedence remain unambiguous.
+private func loadLoRAConfigs(
+    fileSpecs: [String],
+    configPaths: [String],
+    defaultScale: Float
+) throws -> [LoRAConfig] {
+    guard fileSpecs.isEmpty || configPaths.isEmpty else {
+        throw ValidationError("Use either --lora or --lora-config, not both")
+    }
+
+    if !configPaths.isEmpty {
+        return try configPaths.map { configPath in
+            guard FileManager.default.fileExists(atPath: configPath) else {
+                throw ValidationError("LoRA config file not found: \(configPath)")
+            }
+            do {
+                let config = try LoRAConfig.load(from: configPath)
+                guard FileManager.default.fileExists(atPath: config.filePath) else {
+                    throw ValidationError("LoRA file specified in config not found: \(config.filePath)")
+                }
+                return config
+            } catch let error as ValidationError {
+                throw error
+            } catch let error as DecodingError {
+                throw ValidationError("Invalid LoRA config JSON (\(configPath)): \(error)")
+            } catch {
+                throw ValidationError("Failed to load LoRA config \(configPath): \(error.localizedDescription)")
+            }
+        }
+    }
+
+    return try fileSpecs.map { try parseLoRAFileSpec($0, defaultScale: defaultScale) }
+}
+
+func parsePromptUpsampler(
+    _ value: String,
+    path: String?
+) throws -> (model: Flux2PromptUpsampler, path: URL?) {
+    let selected = try Flux2PromptUpsampler.parseCLI(value)
+    guard let path else {
+        return (selected, nil)
+    }
+
+    var isDirectory: ObjCBool = false
+    guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory), isDirectory.boolValue else {
+        throw ValidationError("Prompt upsampler path is not a directory: \(path)")
+    }
+    return (selected, URL(fileURLWithPath: path))
+}
+
 @main
 struct Flux2CLI: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
@@ -95,20 +176,26 @@ struct TextToImage: AsyncParsableCommand {
     @Flag(name: .long, help: "Enhance prompt with more visual details before encoding")
     var upsamplePrompt: Bool = false
 
+    @Option(name: .long, help: "Prompt upsampler model: auto (default), mistral, or qwen3")
+    var upsampleModel: String = "auto"
+
+    @Option(name: .long, help: "Local model directory for --upsample-model (Mistral or Qwen3)")
+    var upsampleModelPath: String?
+
     @Option(name: .long, help: "Image to analyze with VLM and inject description into prompt (semantic interpretation)")
     var interpret: [String] = []
 
     @Option(name: .long, help: "Save intermediate images at each N steps (e.g., 5 saves every 5 steps)")
     var checkpoint: Int?
 
-    @Option(name: .long, help: "LoRA adapter file (.safetensors) for style or capability adaptation")
-    var lora: String?
+    @Option(name: .long, help: "LoRA adapter file; repeat for multiple adapters, optionally append :SCALE")
+    var lora: [String] = []
 
-    @Option(name: .long, help: "LoRA scale factor (default: 1.0)")
+    @Option(name: .long, help: "Default LoRA scale for --lora specs without an inline :SCALE (default: 1.0)")
     var loraScale: Float = 1.0
 
-    @Option(name: .long, help: "LoRA config JSON file (alternative to --lora, includes scheduler overrides)")
-    var loraConfigPath: String?
+    @Option(name: .long, help: "LoRA config JSON file; repeat for multiple adapters (alternative to --lora)")
+    var loraConfig: [String] = []
 
     @Option(name: .long, help: "VAE variant: small-decoder (default, distilled, ~1.4x faster), standard")
     var vaeVariant: String = "small-decoder"
@@ -145,6 +232,7 @@ struct TextToImage: AsyncParsableCommand {
         guard let modelVariant = Flux2Model(rawValue: model) else {
             throw ValidationError("Invalid model: \(model). Use dev, klein-4b, or klein-9b")
         }
+        let promptUpsampler = try parsePromptUpsampler(upsampleModel, path: upsampleModelPath)
 
         // Check if model requires authentication (gated models)
         // Gated: dev, klein-9b (both base and distilled)
@@ -160,34 +248,20 @@ struct TextToImage: AsyncParsableCommand {
             print()
         }
 
-        // Load LoRA config early to get scheduler overrides
-        var loraConfig: LoRAConfig? = nil
-        if let configPath = loraConfigPath {
-            guard FileManager.default.fileExists(atPath: configPath) else {
-                throw ValidationError("LoRA config file not found: \(configPath)")
-            }
-            do {
-                loraConfig = try LoRAConfig.load(from: configPath)
-                guard FileManager.default.fileExists(atPath: loraConfig!.filePath) else {
-                    throw ValidationError("LoRA file specified in config not found: \(loraConfig!.filePath)")
-                }
-            } catch let error as DecodingError {
-                throw ValidationError("Invalid LoRA config JSON: \(error)")
-            }
-        } else if let loraPath = lora {
-            guard FileManager.default.fileExists(atPath: loraPath) else {
-                throw ValidationError("LoRA file not found: \(loraPath)")
-            }
-            loraConfig = LoRAConfig(filePath: loraPath, scale: loraScale)
-        }
+        // Load all LoRAs early so scheduler overrides are available before generation.
+        let loraConfigs = try loadLoRAConfigs(
+            fileSpecs: lora,
+            configPaths: loraConfig,
+            defaultScale: loraScale
+        )
 
         // Apply model-specific defaults for Klein (distilled for 4 steps, guidance 1.0)
-        // LoRA scheduler overrides take precedence if not explicitly set by user
+        // LoRA scheduler overrides take precedence if not explicitly set by user.
+        // If several configs contain overrides, the last one wins, matching the
+        // pipeline's activeSchedulerOverrides behavior.
         let actualSteps: Int
         let actualGuidance: Float
-
-        // Check if LoRA has scheduler overrides
-        let loraOverrides = loraConfig?.schedulerOverrides
+        let loraOverrides = loraConfigs.compactMap { $0.schedulerOverrides }.last
 
         // Priority: CLI flag > LoRA override > model default
         actualSteps = steps ?? loraOverrides?.numSteps ?? modelVariant.defaultSteps
@@ -244,18 +318,22 @@ struct TextToImage: AsyncParsableCommand {
             }
             if upsamplePrompt {
                 print("  Prompt upsampling: enabled (will enhance prompt with visual details)")
+                print("  Prompt upsampler: \(promptUpsampler.model.displayName)\(promptUpsampler.path.map { " [\($0.path)]" } ?? "")")
             }
-            if let loraConfig = loraConfig {
-                print("  LoRA: \(loraConfig.name) (scale: \(loraConfig.effectiveScale))")
-                if let overrides = loraConfig.schedulerOverrides, overrides.hasOverrides {
-                    if overrides.customSigmas != nil {
-                        print("    - Custom sigmas: \(overrides.customSigmas!.count) values")
-                    }
-                    if let recSteps = overrides.numSteps, steps == nil {
-                        print("    - Using recommended steps: \(recSteps)")
-                    }
-                    if let recGuidance = overrides.guidance, guidance == nil {
-                        print("    - Using recommended guidance: \(recGuidance)")
+            if !loraConfigs.isEmpty {
+                print("  LoRAs: \(loraConfigs.count)")
+                for config in loraConfigs {
+                    print("    - \(config.name) (scale: \(config.effectiveScale))")
+                    if let overrides = config.schedulerOverrides, overrides.hasOverrides {
+                        if overrides.customSigmas != nil {
+                            print("      - Custom sigmas: \(overrides.customSigmas!.count) values")
+                        }
+                        if let recSteps = overrides.numSteps, steps == nil {
+                            print("      - Using recommended steps: \(recSteps)")
+                        }
+                        if let recGuidance = overrides.guidance, guidance == nil {
+                            print("      - Using recommended guidance: \(recGuidance)")
+                        }
                     }
                 }
             }
@@ -272,6 +350,8 @@ struct TextToImage: AsyncParsableCommand {
 
         // Create pipeline with HuggingFace token
         let pipeline = Flux2Pipeline(model: modelVariant, quantization: quantConfig, vaeVariant: vaeVar, hfToken: token)
+        pipeline.promptUpsampler = promptUpsampler.model
+        pipeline.promptUpsamplerPath = promptUpsampler.path
 
         // Set memory profile
         switch memoryProfile.lowercased() {
@@ -283,20 +363,19 @@ struct TextToImage: AsyncParsableCommand {
             throw ValidationError("Invalid memory profile: \(memoryProfile). Use auto, conservative, balanced, or performance")
         }
 
-        // Load LoRA if specified
-        if let loraConfig = loraConfig {
+        // Load all LoRAs before the transformer is loaded so they can be fused
+        // together in one pass (important for quantized transformers).
+        for config in loraConfigs {
             do {
-                let info = try pipeline.loadLoRA(loraConfig)
+                let info = try pipeline.loadLoRA(config)
                 if verbose {
-                    print("LoRA loaded: \(info.numLayers) layers, rank \(info.rank), \(String(format: "%.1f", info.memorySizeMB)) MB")
+                    print("LoRA loaded: \(info.numLayers) layers, rank \(info.rank), \(String(format: "%.1f", info.memorySizeMB)) MB — \(config.name)")
                 }
-                if info.targetModel != .unknown {
-                    if info.targetModel.rawValue != modelVariant.rawValue {
-                        print("⚠️  Warning: LoRA was trained for \(info.targetModel.rawValue), but using \(modelVariant.rawValue)")
-                    }
+                if info.targetModel != .unknown && info.targetModel.rawValue != modelVariant.rawValue {
+                    print("⚠️  Warning: LoRA \(config.name) was trained for \(info.targetModel.rawValue), but using \(modelVariant.rawValue)")
                 }
             } catch {
-                throw ValidationError("Failed to load LoRA: \(error.localizedDescription)")
+                throw ValidationError("Failed to load LoRA \(config.name): \(error.localizedDescription)")
             }
         }
 
@@ -411,8 +490,14 @@ struct ImageToImage: AsyncParsableCommand {
     @Option(name: .long, help: "Max VAE encode budget per reference image, in megapixels (1 MP = 1024×1024; default 1.0). Raise for higher-fidelity conditioning at the cost of memory; e.g. 4.0 ≈ 2048².")
     var maxReferenceMegapixels: Double?
 
-    @Flag(name: .long, help: "Enhance prompt with visual details using Mistral before encoding")
+    @Flag(name: .long, help: "Enhance prompt with visual details using the selected prompt upsampler")
     var upsamplePrompt: Bool = false
+
+    @Option(name: .long, help: "Prompt upsampler model: auto (default), mistral, or qwen3")
+    var upsampleModel: String = "auto"
+
+    @Option(name: .long, help: "Local model directory for --upsample-model (Mistral or Qwen3)")
+    var upsampleModelPath: String?
 
     @Option(name: .long, help: "Save checkpoint image every N steps")
     var checkpoint: Int?
@@ -434,14 +519,14 @@ struct ImageToImage: AsyncParsableCommand {
     @Option(name: .long, help: "Transformer quantization: \(TransformerQuantization.cliValueList)")
     var transformerQuant: String = "qint8"
 
-    @Option(name: .long, help: "LoRA adapter file (.safetensors) for style or capability adaptation")
-    var lora: String?
+    @Option(name: .long, help: "LoRA adapter file; repeat for multiple adapters, optionally append :SCALE")
+    var lora: [String] = []
 
-    @Option(name: .long, help: "LoRA scale factor (default: 1.0)")
+    @Option(name: .long, help: "Default LoRA scale for --lora specs without an inline :SCALE (default: 1.0)")
     var loraScale: Float = 1.0
 
-    @Option(name: .long, help: "LoRA config JSON file (alternative to --lora, includes scheduler overrides)")
-    var loraConfigPath: String?
+    @Option(name: .long, help: "LoRA config JSON file; repeat for multiple adapters (alternative to --lora)")
+    var loraConfig: [String] = []
 
     @Option(name: .long, help: "VAE variant: small-decoder (default, distilled, ~1.4x faster), standard")
     var vaeVariant: String = "small-decoder"
@@ -476,6 +561,7 @@ struct ImageToImage: AsyncParsableCommand {
         guard let modelVariant = Flux2Model(rawValue: model) else {
             throw ValidationError("Invalid model: \(model). Use dev, klein-4b, or klein-9b")
         }
+        let promptUpsampler = try parsePromptUpsampler(upsampleModel, path: upsampleModelPath)
 
         // Check if model requires authentication (gated models)
         // Gated: dev, klein-9b (both base and distilled)
@@ -491,32 +577,18 @@ struct ImageToImage: AsyncParsableCommand {
             print()
         }
 
-        // Load LoRA config early to get scheduler overrides
-        var loraConfig: LoRAConfig? = nil
-        if let configPath = loraConfigPath {
-            guard FileManager.default.fileExists(atPath: configPath) else {
-                throw ValidationError("LoRA config file not found: \(configPath)")
-            }
-            do {
-                loraConfig = try LoRAConfig.load(from: configPath)
-                guard FileManager.default.fileExists(atPath: loraConfig!.filePath) else {
-                    throw ValidationError("LoRA file specified in config not found: \(loraConfig!.filePath)")
-                }
-            } catch let error as DecodingError {
-                throw ValidationError("Invalid LoRA config JSON: \(error)")
-            }
-        } else if let loraPath = lora {
-            guard FileManager.default.fileExists(atPath: loraPath) else {
-                throw ValidationError("LoRA file not found: \(loraPath)")
-            }
-            loraConfig = LoRAConfig(filePath: loraPath, scale: loraScale)
-        }
+        // Load all LoRAs early so scheduler overrides are available before generation.
+        let loraConfigs = try loadLoRAConfigs(
+            fileSpecs: lora,
+            configPaths: loraConfig,
+            defaultScale: loraScale
+        )
 
         // Apply model-specific defaults for Klein (distilled for 4 steps, guidance 1.0)
-        // LoRA scheduler overrides take precedence if not explicitly set by user
+        // LoRA scheduler overrides take precedence if not explicitly set by user.
         let actualSteps: Int
         let actualGuidance: Float
-        let loraOverrides = loraConfig?.schedulerOverrides
+        let loraOverrides = loraConfigs.compactMap { $0.schedulerOverrides }.last
 
         // Priority: CLI flag > LoRA override > model default
         actualSteps = steps ?? loraOverrides?.numSteps ?? modelVariant.defaultSteps
@@ -570,6 +642,7 @@ struct ImageToImage: AsyncParsableCommand {
             print("  Prompt: \"\(prompt)\"")
             if upsamplePrompt {
                 print("  Prompt upsampling: enabled")
+                print("  Prompt upsampler: \(promptUpsampler.model.displayName)\(promptUpsampler.path.map { " [\($0.path)]" } ?? "")")
             }
         }
 
@@ -596,17 +669,20 @@ struct ImageToImage: AsyncParsableCommand {
         }
 
         // Print LoRA info if specified
-        if verbose, let loraConfig = loraConfig {
-            print("LoRA: \(loraConfig.name) (scale: \(loraConfig.effectiveScale))")
-            if let overrides = loraConfig.schedulerOverrides, overrides.hasOverrides {
-                if overrides.customSigmas != nil {
-                    print("  - Custom sigmas: \(overrides.customSigmas!.count) values")
-                }
-                if let recSteps = overrides.numSteps, steps == nil {
-                    print("  - Using recommended steps: \(recSteps)")
-                }
-                if let recGuidance = overrides.guidance, guidance == nil {
-                    print("  - Using recommended guidance: \(recGuidance)")
+        if verbose, !loraConfigs.isEmpty {
+            print("LoRAs: \(loraConfigs.count)")
+            for config in loraConfigs {
+                print("  - \(config.name) (scale: \(config.effectiveScale))")
+                if let overrides = config.schedulerOverrides, overrides.hasOverrides {
+                    if overrides.customSigmas != nil {
+                        print("    - Custom sigmas: \(overrides.customSigmas!.count) values")
+                    }
+                    if let recSteps = overrides.numSteps, steps == nil {
+                        print("    - Using recommended steps: \(recSteps)")
+                    }
+                    if let recGuidance = overrides.guidance, guidance == nil {
+                        print("    - Using recommended guidance: \(recGuidance)")
+                    }
                 }
             }
         }
@@ -618,6 +694,8 @@ struct ImageToImage: AsyncParsableCommand {
 
         // Create pipeline with HuggingFace token
         let pipeline = Flux2Pipeline(model: modelVariant, quantization: quantConfig, vaeVariant: vaeVar, hfToken: token)
+        pipeline.promptUpsampler = promptUpsampler.model
+        pipeline.promptUpsamplerPath = promptUpsampler.path
 
         // Set memory profile
         switch memoryProfile.lowercased() {
@@ -629,20 +707,19 @@ struct ImageToImage: AsyncParsableCommand {
             throw ValidationError("Invalid memory profile: \(memoryProfile). Use auto, conservative, balanced, or performance")
         }
 
-        // Load LoRA if specified
-        if let loraConfig = loraConfig {
+        // Load all LoRAs before the transformer is loaded so they can be fused
+        // together in one pass (important for quantized transformers).
+        for config in loraConfigs {
             do {
-                let info = try pipeline.loadLoRA(loraConfig)
+                let info = try pipeline.loadLoRA(config)
                 if verbose {
-                    print("LoRA loaded: \(info.numLayers) layers, rank \(info.rank), \(String(format: "%.1f", info.memorySizeMB)) MB")
+                    print("LoRA loaded: \(info.numLayers) layers, rank \(info.rank), \(String(format: "%.1f", info.memorySizeMB)) MB — \(config.name)")
                 }
-                if info.targetModel != .unknown {
-                    if info.targetModel.rawValue != modelVariant.rawValue {
-                        print("⚠️  Warning: LoRA was trained for \(info.targetModel.rawValue), but using \(modelVariant.rawValue)")
-                    }
+                if info.targetModel != .unknown && info.targetModel.rawValue != modelVariant.rawValue {
+                    print("⚠️  Warning: LoRA \(config.name) was trained for \(info.targetModel.rawValue), but using \(modelVariant.rawValue)")
                 }
             } catch {
-                throw ValidationError("Failed to load LoRA: \(error.localizedDescription)")
+                throw ValidationError("Failed to load LoRA \(config.name): \(error.localizedDescription)")
             }
         }
 

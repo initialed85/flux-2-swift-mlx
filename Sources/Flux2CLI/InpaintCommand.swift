@@ -89,6 +89,12 @@ struct Inpaint: AsyncParsableCommand {
     @Flag(name: .long, help: "Text-encoder-only prompt rewriting (Mistral/Klein-Qwen3). Does NOT look at the image. For image-aware rewriting that inherits the source's lighting/camera/materials, use --enrich-prompt-with-vlm instead.")
     var upsamplePrompt: Bool = false
 
+    @Option(name: .long, help: "Prompt upsampler model: auto (default), mistral, or qwen3")
+    var upsampleModel: String = "auto"
+
+    @Option(name: .long, help: "Local model directory for --upsample-model (Mistral or Qwen3)")
+    var upsampleModelPath: String?
+
     @Flag(name: .long, help: "Image-aware prompt rewriting via a VLM (--vlm-provider: bundled Qwen3.5 by default, or Gemma 4 E2B). The VLM looks at --image and rewrites --prompt into a 30-80 word BFL-style Flux 2 prompt that inherits the source's photographic identity (camera angle, lighting direction, materials, palette, depth of field). Strictly optional: if no VLM is loaded, the chain falls back to --prompt verbatim with a warning. Pass --qwen35-variant/--qwen35-path (or --gemma4-variant/--gemma4-path) to have this command load one in-process. When both --upsample-prompt and --enrich-prompt-with-vlm are set, the VLM wins.")
     var enrichPromptWithVLM: Bool = false
 
@@ -155,6 +161,7 @@ struct Inpaint: AsyncParsableCommand {
         logErr("Prompt: \(prompt)")
 
         let modelChoice = try Flux2Model.parseCLI(fluxModel)
+        let promptUpsampler = try parsePromptUpsampler(upsampleModel, path: upsampleModelPath)
 
         // Optional VLM load — only relevant when the user opts into
         // --enrich-prompt-with-vlm. The chain itself doesn't auto-load; we do
@@ -188,6 +195,8 @@ struct Inpaint: AsyncParsableCommand {
         )
         pipeline.compileDenoisingStep = compileStep
         pipeline.keepTextEncoderLoaded = keepTextEncoder
+        pipeline.promptUpsampler = promptUpsampler.model
+        pipeline.promptUpsamplerPath = promptUpsampler.path
         let loadStart = Date()
         try await pipeline.loadModels()
         logErr("✓ Flux2 pipeline ready in \(String(format: "%.1fs", Date().timeIntervalSince(loadStart)))")

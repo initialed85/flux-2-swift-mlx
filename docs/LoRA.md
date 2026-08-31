@@ -15,13 +15,34 @@ flux2 i2i "your prompt" \
   -o output.png
 ```
 
+Multiple adapters can be stacked in one generation. Append `:SCALE` to
+individual file specs when they need different strengths:
+
+```bash
+flux2 t2i "a portrait in a cinematic style" \
+  --model klein-9b \
+  --lora /path/to/style.safetensors:0.7 \
+  --lora /path/to/character.safetensors:0.85 \
+  -o output.png
+```
+
+A bare `--lora PATH` uses the shared `--lora-scale` value. JSON configs can
+also be repeated, but cannot be mixed with raw `--lora` specs:
+
+```bash
+flux2 t2i "a landscape" \
+  --lora-config style-config.json \
+  --lora-config character-config.json \
+  -o output.png
+```
+
 ## CLI Options
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--lora` | none | Path to LoRA safetensors file |
-| `--lora-scale` | `1.0` | LoRA scale factor (typically 0.5-1.5) |
-| `--lora-config` | none | Path to JSON config file (for advanced LoRAs) |
+| `--lora` | none | LoRA safetensors file; repeat for multiple adapters, optionally append `:SCALE` |
+| `--lora-scale` | `1.0` | Default scale for `--lora` specs without an inline scale |
+| `--lora-config` | none | JSON config file; repeat for multiple adapters (alternative to `--lora`) |
 
 ### JSON Config Format
 
@@ -62,11 +83,17 @@ flux2 t2i "a beautiful landscape" \
 
 ## How It Works
 
-LoRA weights are merged into the transformer at load time:
+LoRA weights are merged into the transformer at load time. When several
+adapters are supplied, their updates are additive:
 
 ```
-new_weight = original_weight + scale × (loraB @ loraA)
+new_weight = original_weight + scale₁ × delta₁ + scale₂ × delta₂ + ...
 ```
+
+All adapters should target the same model architecture. Loading the complete
+stack before the transformer is loaded is preferred, especially for quantized
+transformers, because it performs one combined merge instead of repeated
+requantization.
 
 The loader also accepts direct **LoKr** adapters emitted by LyCORIS and
 ai-toolkit (`*.lokr_w1` + `*.lokr_w2`). Those updates are reconstructed as

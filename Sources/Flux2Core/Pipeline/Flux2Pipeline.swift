@@ -7,6 +7,7 @@ import MLXRandom
 import MLXNN
 import CoreGraphics
 import ImageIO
+import FluxTextEncoders
 
 #if canImport(AppKit)
 import AppKit
@@ -281,6 +282,16 @@ public class Flux2Pipeline: @unchecked Sendable {
     /// the pipeline instance still frees the encoder as usual.
     public var keepTextEncoderLoaded: Bool = false
 
+    /// Selects the language model used when `upsamplePrompt` is enabled.
+    /// `.automatic` preserves the model-specific historical behavior.
+    public var promptUpsampler: Flux2PromptUpsampler = .automatic
+
+    /// Optional local model directory for the selected prompt upsampler.
+    /// The directory must contain the matching Mistral or Qwen3 tokenizer and
+    /// safetensors files. When set, the selected model is loaded temporarily
+    /// for rewriting and the primary image-conditioning encoder is reloaded.
+    public var promptUpsamplerPath: URL?
+
     /// Initialize the Flux.2 pipeline
     /// - Parameters:
     ///   - model: Model variant (dev, klein-4b, klein-9b)
@@ -476,6 +487,124 @@ public class Flux2Pipeline: @unchecked Sendable {
             Thread.sleep(forTimeInterval: 0.5)
             memoryManager.fullCleanup()
             eval([])
+        }
+    }
+
+    /// Resolve the model used for text-only prompt rewriting.
+    private var resolvedPromptUpsampler: Flux2PromptUpsampler {
+        if promptUpsampler != .automatic {
+            return promptUpsampler
+        }
+        switch model {
+        case .dev:
+            return .mistral
+        case .klein4B, .klein4BBase, .klein9B, .klein9BBase, .klein9BKV:
+            return .qwen3
+        }
+    }
+
+    /// Quantization used by the text encoders and prompt rewriter.
+    private var textEncoderQuantization: MistralQuantization {
+        switch quantization.textEncoder {
+        case .bf16: return .bf16
+        case .mlx8bit: return .mlx8bit
+        case .mlx6bit: return .mlx6bit
+        case .mlx4bit: return .mlx4bit
+        }
+    }
+
+    /// Klein variant to use when Qwen3 is selected as an alternate prompt
+    /// rewriter. For Dev there is no matching image encoder, so use the larger
+    /// Qwen3-8B model by default; a local path can override that choice.
+    private var promptUpsamplerKleinVariant: KleinVariant {
+        switch model {
+        case .klein4B, .klein4BBase:
+            return .klein4B
+        case .dev, .klein9B, .klein9BBase, .klein9BKV:
+            return .klein9B
+        }
+    }
+
+    private var isKleinModel: Bool {
+        switch model {
+        case .dev: return false
+        case .klein4B, .klein4BBase, .klein9B, .klein9BBase, .klein9BKV: return true
+        }
+    }
+
+    /// Whether the current I2I upsampling path should retain image-aware
+    /// Mistral VLM behavior. An explicit model/path override opts into the
+    /// text-only rewriter instead.
+    private var usesAutomaticVisionUpsampler: Bool {
+        promptUpsamplerPath == nil && (promptUpsampler == .automatic || promptUpsampler == .mistral)
+    }
+
+    /// Rewrite a prompt using the selected text-only model. The Bool indicates
+    /// whether loading the temporary rewriter invalidated the primary encoder.
+    private func upsampleTextOnlyPrompt(_ prompt: String) async throws -> (prompt: String, reloadPrimaryEncoder: Bool) {
+        switch resolvedPromptUpsampler {
+        case .mistral:
+            // Dev already has Mistral loaded; use it directly unless a local
+            // override path was explicitly provided.
+            if model == .dev, promptUpsamplerPath == nil {
+                guard let textEncoder else {
+                    throw Flux2Error.modelNotLoaded("Mistral text encoder not loaded")
+                }
+                return (try textEncoder.upsamplePrompt(prompt), false)
+            }
+
+            Flux2Debug.log("Using Mistral as an alternate prompt upsampler")
+            let temporaryEncoder = Flux2TextEncoder(quantization: textEncoderQuantization)
+            try await temporaryEncoder.load(from: promptUpsamplerPath)
+            defer {
+                temporaryEncoder.unload()
+                memoryManager.fullCleanup()
+            }
+            return (try temporaryEncoder.upsamplePrompt(prompt), true)
+
+        case .qwen3:
+            // Klein already has Qwen3 loaded; use it directly unless a local
+            // override path was explicitly provided.
+            if isKleinModel, promptUpsamplerPath == nil {
+                guard let kleinEncoder else {
+                    throw Flux2Error.modelNotLoaded("Qwen3 text encoder not loaded")
+                }
+                return (try kleinEncoder.upsamplePrompt(prompt), false)
+            }
+
+            Flux2Debug.log("Using Qwen3 as an alternate prompt upsampler")
+            let temporaryEncoder = KleinTextEncoder(
+                variant: promptUpsamplerKleinVariant,
+                quantization: textEncoderQuantization
+            )
+            try await temporaryEncoder.load(from: promptUpsamplerPath)
+            defer {
+                temporaryEncoder.unload()
+                memoryManager.fullCleanup()
+            }
+            return (try temporaryEncoder.upsamplePrompt(prompt), isKleinModel)
+
+        case .automatic:
+            // resolvedPromptUpsampler always resolves automatic to a concrete
+            // encoder based on the selected image model.
+            throw Flux2Error.invalidConfiguration("Unable to resolve prompt upsampler")
+        }
+    }
+
+    /// Reload the primary image-conditioning text encoder after an alternate
+    /// prompt rewriter has been unloaded from the shared encoder singleton.
+    private func reloadPrimaryTextEncoder() async throws {
+        switch model {
+        case .dev:
+            guard let textEncoder else {
+                throw Flux2Error.modelNotLoaded("Mistral text encoder not initialized")
+            }
+            try await textEncoder.load()
+        case .klein4B, .klein4BBase, .klein9B, .klein9BBase, .klein9BKV:
+            guard let kleinEncoder else {
+                throw Flux2Error.modelNotLoaded("Qwen3 text encoder not initialized")
+            }
+            try await kleinEncoder.load(from: kleinEncoderPath)
         }
     }
 
@@ -1324,29 +1453,38 @@ public class Flux2Pipeline: @unchecked Sendable {
             }
 
             profiler.start("2. Text Encoding")
-            // Use vision-based upsampling for I2I if enabled (Dev only)
-            // Track the final prompt used for generation
+            // Automatic I2I upsampling keeps the existing image-aware Mistral
+            // VLM path. An explicit model or path selects text-only rewriting.
+            let useVisionUpsampler = upsamplePrompt && usesAutomaticVisionUpsampler
 
             switch model {
             case .dev:
-                if upsamplePrompt, case .imageToImage(let images) = mode {
+                if useVisionUpsampler, case .imageToImage(let images) = mode {
                     // Use VLM to analyze reference images and enhance prompt
                     Flux2Debug.log("Using vision-based prompt upsampling for I2I with \(images.count) image(s)")
                     let enhancedPrompt = try await textEncoder!.upsamplePromptWithImages(enrichedPrompt, images: images)
                     finalUsedPrompt = enhancedPrompt
                     wasPromptUpsampled = true
                     textEmbeddings = try textEncoder!.encode(enhancedPrompt, upsample: false)
+                } else if upsamplePrompt {
+                    let rewritten = try await upsampleTextOnlyPrompt(enrichedPrompt)
+                    if rewritten.reloadPrimaryEncoder {
+                        try await reloadPrimaryTextEncoder()
+                    }
+                    finalUsedPrompt = rewritten.prompt
+                    wasPromptUpsampled = rewritten.prompt != enrichedPrompt
+                    textEmbeddings = try textEncoder!.encode(rewritten.prompt, upsample: false)
                 } else {
-                    let (embeddings, usedPrompt) = try textEncoder!.encodeWithPrompt(enrichedPrompt, upsample: upsamplePrompt)
+                    let (embeddings, usedPrompt) = try textEncoder!.encodeWithPrompt(enrichedPrompt, upsample: false)
                     textEmbeddings = embeddings
                     finalUsedPrompt = usedPrompt
-                    wasPromptUpsampled = upsamplePrompt && (usedPrompt != enrichedPrompt)
                 }
 
             case .klein4B, .klein4BBase, .klein9B, .klein9BBase, .klein9BKV:
-                // Klein I2I with upsampling: load Mistral VLM temporarily to see reference images
-                // This matches the official flux2 implementation which loads Mistral for Klein I2I upsampling
-                if upsamplePrompt, case .imageToImage(let images) = mode {
+                // Klein I2I with automatic upsampling: load Mistral VLM
+                // temporarily to analyze reference images. This preserves the
+                // existing official Flux.2 behavior.
+                if useVisionUpsampler, case .imageToImage(let images) = mode {
                     Flux2Debug.log("Klein I2I with upsampling: using Mistral VLM to analyze reference images...")
 
                     // Step 1: Unload Qwen3 (already loaded by loadTextEncoder) to free memory for Mistral
@@ -1376,12 +1514,18 @@ public class Flux2Pipeline: @unchecked Sendable {
 
                     // Step 6: Encode with Qwen3 (already upsampled, so upsample=false)
                     textEmbeddings = try kleinEncoder!.encode(enhancedPrompt, upsample: false)
+                } else if upsamplePrompt {
+                    let rewritten = try await upsampleTextOnlyPrompt(enrichedPrompt)
+                    if rewritten.reloadPrimaryEncoder {
+                        try await reloadPrimaryTextEncoder()
+                    }
+                    finalUsedPrompt = rewritten.prompt
+                    wasPromptUpsampled = rewritten.prompt != enrichedPrompt
+                    textEmbeddings = try kleinEncoder!.encode(rewritten.prompt, upsample: false)
                 } else {
-                    // Standard Klein encoding (text-only upsampling if enabled)
-                    let (embeddings, usedPrompt) = try kleinEncoder!.encodeWithPrompt(enrichedPrompt, upsample: upsamplePrompt)
+                    let (embeddings, usedPrompt) = try kleinEncoder!.encodeWithPrompt(enrichedPrompt, upsample: false)
                     textEmbeddings = embeddings
                     finalUsedPrompt = usedPrompt
-                    wasPromptUpsampled = upsamplePrompt && (usedPrompt != enrichedPrompt)
                 }
             }
             eval(textEmbeddings)

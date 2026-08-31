@@ -5,6 +5,25 @@ import Foundation
 
 // MARK: - Model Selection
 
+/// Text model used to rewrite prompts when prompt upsampling is enabled.
+///
+/// `automatic` preserves the historical behavior: Dev uses Mistral and
+/// Klein uses Qwen3 for text-only upsampling. I2I's automatic path also keeps
+/// its existing Mistral VLM-based image-aware rewrite.
+public enum Flux2PromptUpsampler: String, CaseIterable, Sendable {
+    case automatic = "auto"
+    case mistral
+    case qwen3
+
+    public var displayName: String {
+        switch self {
+        case .automatic: return "Automatic"
+        case .mistral: return "Mistral"
+        case .qwen3: return "Qwen3"
+        }
+    }
+}
+
 /// Flux.2 model variants
 public enum Flux2Model: String, CaseIterable, Sendable {
     /// Flux.2 Dev - 32B parameters, Mistral text encoder
