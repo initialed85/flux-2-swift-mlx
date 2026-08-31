@@ -328,6 +328,39 @@ final class LoRAConfigTests: XCTestCase {
         XCTAssertEqual(config.activationKeyword, "sks")
     }
 
+    func testAdapterQualifiedLoRALoading() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("flux2-peft-lora-\(UUID().uuidString).safetensors")
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        // PEFT saves the adapter name between the matrix kind and `.weight`.
+        // This is the format used by lenovo.flux.klein9b.safetensors.
+        let loraA = MLXArray([
+            Float(1), Float(0), Float(0), Float(0),
+            Float(0), Float(1), Float(0), Float(0)
+        ], [2, 4])
+        let loraB = MLXArray([
+            Float(1), Float(0),
+            Float(0), Float(1),
+            Float(1), Float(1),
+            Float(2), Float(0),
+            Float(0), Float(2),
+            Float(2), Float(2)
+        ], [6, 2])
+        try save(arrays: [
+            "diffusion_model.single_blocks.0.linear1.lora_A.default.weight": loraA,
+            "diffusion_model.single_blocks.0.linear1.lora_B.default.weight": loraB
+        ], metadata: ["format": "pt"], url: url)
+
+        let manager = LoRAManager()
+        let info = try manager.loadLoRA(LoRAConfig(filePath: url.path))
+
+        XCTAssertEqual(info.numLayers, 1)
+        XCTAssertEqual(info.rank, 2)
+        XCTAssertEqual(manager.loadedLayerPaths, ["singleTransformerBlocks.0.attn.toQkvMlp"])
+        XCTAssertTrue(manager.hasLoRA(for: "singleTransformerBlocks.0.attn.toQkvMlp"))
+    }
+
     func testLoKRAdapterLoadingAndApplication() throws {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("flux2-lokr-\(UUID().uuidString).safetensors")

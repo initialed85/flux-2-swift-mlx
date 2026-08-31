@@ -127,12 +127,11 @@ public class LoRALoader {
 
             let basePath: String
             let kind: String
-            if key.hasSuffix(".lora_A.weight") {
-                basePath = String(key.dropLast(".lora_A.weight".count))
-                kind = "loraA"
-            } else if key.hasSuffix(".lora_B.weight") {
-                basePath = String(key.dropLast(".lora_B.weight".count))
-                kind = "loraB"
+            if let standard = splitStandardLoRAKey(key) {
+                // PEFT/diffusers commonly inserts an adapter name between the
+                // matrix kind and `.weight`, e.g. `lora_A.default.weight`.
+                basePath = standard.basePath
+                kind = standard.kind
             } else if key.hasSuffix(".lokr_w1") {
                 basePath = String(key.dropLast(".lokr_w1".count))
                 kind = "lokrW1"
@@ -246,6 +245,30 @@ public class LoRALoader {
             targetModel: targetModel)
 
         Flux2Debug.log("[LoRA] Info: \(mappedLayers) layers, rank=\(rank), params=\(totalParams), target=\(targetModel.rawValue)")
+    }
+
+    /// Parse conventional PEFT keys with either `lora_A.weight` or an
+    /// adapter-qualified `lora_A.<adapter>.weight` suffix.
+    private func splitStandardLoRAKey(_ key: String) -> (basePath: String, kind: String)? {
+        let components = key.split(separator: ".").map(String.init)
+        guard components.last == "weight", components.count >= 3 else {
+            return nil
+        }
+
+        var markerIndex: Int?
+        for index in components.indices.reversed() {
+            if components[index] == "lora_A" || components[index] == "lora_B" {
+                markerIndex = index
+                break
+            }
+        }
+        guard let markerIndex, markerIndex > 0, markerIndex < components.count - 1 else {
+            return nil
+        }
+
+        let basePath = components[..<markerIndex].joined(separator: ".")
+        let kind = components[markerIndex] == "lora_A" ? "loraA" : "loraB"
+        return (basePath, kind)
     }
 
     /// Strip prefixes used by PEFT/diffusers exports while retaining the
