@@ -68,10 +68,17 @@ LoRA weights are merged into the transformer at load time:
 new_weight = original_weight + scale × (loraB @ loraA)
 ```
 
+The loader also accepts direct **LoKr** adapters emitted by LyCORIS and
+ai-toolkit (`*.lokr_w1` + `*.lokr_w2`). Those updates are reconstructed as
+`kron(w1, w2)` during fusion. Fused BFL QKV updates are split into the
+transformer's separate Q/K/V projections after expansion, preserving the
+same row ordering as the base checkpoint.
+
 This approach:
 - Preserves the original model weights
 - Allows adjusting influence via `--lora-scale`
-- Adds minimal overhead (~76MB for rank-16 LoRAs)
+- Adds minimal overhead (~76MB for rank-16 LoRAs; LoKr factors stay compact
+  until each layer is merged)
 
 ## Compatibility
 

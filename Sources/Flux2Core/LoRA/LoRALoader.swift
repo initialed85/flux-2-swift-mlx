@@ -29,8 +29,11 @@ public enum LoRALoaderError: Error, LocalizedError {
 /// Loads LoRA weights from safetensors files
 public class LoRALoader {
 
-    /// Loaded LoRA weights, keyed by target layer path
+    /// Loaded standard LoRA weights, keyed by target layer path
     private(set) var weights: [String: LoRAWeightPair] = [:]
+
+    /// Loaded direct LoKr factors, keyed by target layer path
+    private(set) var lokrWeights: [String: LoKRWeightPair] = [:]
 
     /// LoRA information
     private(set) var info: LoRAInfo?
@@ -68,7 +71,12 @@ public class LoRALoader {
         // Parse LoRA weights and map to layer paths
         try parseAndMapWeights(rawWeights)
 
-        Flux2Debug.log("[LoRA] Mapped \(weights.count) layer pairs")
+        let mappedCount = weights.count + lokrWeights.count
+        guard mappedCount > 0 else {
+            throw LoRALoaderError.invalidFormat(
+                "No supported LoRA layers found. Expected lora_A/lora_B or direct lokr_w1/lokr_w2 tensors.")
+        }
+        Flux2Debug.log("[LoRA] Mapped \(mappedCount) layer pairs (LoRA: \(weights.count), LoKr: \(lokrWeights.count))")
     }
     
     /// Parse metadata to extract LoRA scale factor (alpha/rank)
@@ -100,71 +108,79 @@ public class LoRALoader {
         return keys.contains { $0.contains("transformer_blocks") || $0.contains("single_transformer_blocks") }
     }
 
-    /// Parse raw weights and map to our layer naming scheme
+    /// Parse raw weights and map to our layer naming scheme.
+    ///
+    /// In addition to ordinary PEFT LoRA (lora_A/lora_B), this accepts the
+    /// direct LoKr format emitted by ai-toolkit/LyCORIS:
+    /// `*.lokr_w1`, `*.lokr_w2`, and a per-layer `*.alpha`.  The alpha tensor
+    /// is intentionally not retained for direct factors; LyCORIS uses alpha
+    /// only to normalize decomposed factors, while direct w1/w2 exports are
+    /// already at their runtime scale.
     private func parseAndMapWeights(_ rawWeights: [String: MLXArray]) throws {
-        // Group weights by layer (strip lora_A/lora_B suffix)
         var layerGroups: [String: (loraA: MLXArray?, loraB: MLXArray?)] = [:]
+        var lokrGroups: [String: (w1: MLXArray?, w2: MLXArray?)] = [:]
+        var formatKeys: [String] = []
 
         for (key, value) in rawWeights {
-            // Skip metadata keys
+            // Skip metadata keys.
             if key.hasPrefix("__") { continue }
 
-            // Extract base layer path
-            // Format: base_model.model.{layer_path}.lora_A.weight
-            //      or base_model.model.{layer_path}.lora_B.weight
-            //      or transformer.{layer_path}.lora_A.weight (Diffusers format)
             let basePath: String
-            let isLoraA: Bool
-
+            let kind: String
             if key.hasSuffix(".lora_A.weight") {
                 basePath = String(key.dropLast(".lora_A.weight".count))
-                isLoraA = true
+                kind = "loraA"
             } else if key.hasSuffix(".lora_B.weight") {
                 basePath = String(key.dropLast(".lora_B.weight".count))
-                isLoraA = false
+                kind = "loraB"
+            } else if key.hasSuffix(".lokr_w1") {
+                basePath = String(key.dropLast(".lokr_w1".count))
+                kind = "lokrW1"
+            } else if key.hasSuffix(".lokr_w2") {
+                basePath = String(key.dropLast(".lokr_w2".count))
+                kind = "lokrW2"
+            } else if key.hasSuffix(".alpha") {
+                // Direct LoKr alpha is deliberately ignored.  Still record
+                // the path for format detection and diagnostics.
+                basePath = String(key.dropLast(".alpha".count))
+                kind = "alpha"
             } else {
                 Flux2Debug.verbose("[LoRA] Skipping non-LoRA key: \(key)")
                 continue
             }
 
-            // Strip common prefixes
-            var layerPath = basePath
-            if layerPath.hasPrefix("base_model.model.") {
-                layerPath = String(layerPath.dropFirst("base_model.model.".count))
-            }
-            if layerPath.hasPrefix("transformer.") {
-                layerPath = String(layerPath.dropFirst("transformer.".count))
-            }
-            if layerPath.hasPrefix("diffusion_model.") {
-                layerPath = String(layerPath.dropFirst("diffusion_model.".count))
-            }
+            let layerPath = normalizeLayerPath(basePath)
+            formatKeys.append(layerPath)
 
-            if layerGroups[layerPath] == nil {
-                layerGroups[layerPath] = (nil, nil)
-            }
-
-            if isLoraA {
-                layerGroups[layerPath]?.loraA = value
-            } else {
-                layerGroups[layerPath]?.loraB = value
+            switch kind {
+            case "loraA":
+                layerGroups[layerPath, default: (nil, nil)].loraA = value
+            case "loraB":
+                layerGroups[layerPath, default: (nil, nil)].loraB = value
+            case "lokrW1":
+                lokrGroups[layerPath, default: (nil, nil)].w1 = value
+            case "lokrW2":
+                lokrGroups[layerPath, default: (nil, nil)].w2 = value
+            default:
+                break
             }
         }
 
-        // Detect format
-        let isDiffusers = isDiffusersFormat(Array(layerGroups.keys))
+        // Detect format from normalized layer paths (after common prefixes
+        // have been removed, BFL uses double_blocks/single_blocks).
+        let isDiffusers = isDiffusersFormat(formatKeys)
         Flux2Debug.log("[LoRA] Detected format: \(isDiffusers ? "Diffusers" : "BFL")")
 
-        // Convert to weight pairs and map to our naming scheme
         var rank: Int = 0
         var totalParams = 0
 
+        // Convert standard LoRA pairs.
         for (rawPath, pair) in layerGroups {
             guard let loraA = pair.loraA, let loraB = pair.loraB else {
                 Flux2Debug.log("[LoRA] Warning: Missing pair for \(rawPath)")
                 continue
             }
 
-            // Get rank from first pair
             if rank == 0 {
                 rank = loraA.shape[0]
                 Flux2Debug.log("[LoRA] Detected rank: \(rank)")
@@ -172,46 +188,80 @@ public class LoRALoader {
             }
 
             if isDiffusers {
-                // Diffusers format: direct 1:1 mapping with name conversion
                 let swiftPath = mapDiffusersPathToSwiftPath(rawPath)
                 weights[swiftPath] = LoRAWeightPair(
-                    loraA: MLXArrayWrapper(loraA),
-                    loraB: MLXArrayWrapper(loraB)
-                )
+                    loraA: MLXArrayWrapper(loraA), loraB: MLXArrayWrapper(loraB))
                 totalParams += loraA.size + loraB.size
-            } else {
-                // BFL format: may need QKV splitting
-                if isCombinedQKVLayer(rawPath) {
-                    let splitPairs = splitQKVLoRA(bflPath: rawPath, loraA: loraA, loraB: loraB)
-                    for (swiftPath, splitLoraA, splitLoraB) in splitPairs {
-                        weights[swiftPath] = LoRAWeightPair(
-                            loraA: MLXArrayWrapper(splitLoraA),
-                            loraB: MLXArrayWrapper(splitLoraB)
-                        )
-                        totalParams += splitLoraA.size + splitLoraB.size
-                    }
-                } else {
-                    let swiftPath = mapBFLPathToSwiftPath(rawPath)
+            } else if isCombinedQKVLayer(rawPath) {
+                let splitPairs = splitQKVLoRA(bflPath: rawPath, loraA: loraA, loraB: loraB)
+                for (swiftPath, splitLoraA, splitLoraB) in splitPairs {
                     weights[swiftPath] = LoRAWeightPair(
-                        loraA: MLXArrayWrapper(loraA),
-                        loraB: MLXArrayWrapper(loraB)
-                    )
-                    totalParams += loraA.size + loraB.size
+                        loraA: MLXArrayWrapper(splitLoraA), loraB: MLXArrayWrapper(splitLoraB))
+                    totalParams += splitLoraA.size + splitLoraB.size
                 }
+            } else {
+                let swiftPath = mapBFLPathToSwiftPath(rawPath)
+                weights[swiftPath] = LoRAWeightPair(
+                    loraA: MLXArrayWrapper(loraA), loraB: MLXArrayWrapper(loraB))
+                totalParams += loraA.size + loraB.size
             }
         }
 
-        // Detect target model based on layer structure
-        let targetModel = detectTargetModel(layerGroups.keys.map { $0 })
+        // Convert direct LoKr pairs.  Combined BFL QKV paths are kept as one
+        // pair and split after kron expansion during fusion; splitting w2
+        // before expansion would produce the wrong row ordering.
+        for (rawPath, pair) in lokrGroups {
+            guard let w1 = pair.w1, let w2 = pair.w2 else {
+                Flux2Debug.log("[LoRA] Warning: Missing LoKr factor pair for \(rawPath)")
+                continue
+            }
 
+            if rank == 0 {
+                rank = w1.shape.first ?? 0
+                Flux2Debug.log("[LoRA] Detected LoKr rank/factor: \(rank)")
+                Flux2Debug.log("[LoRA] w1 dtype: \(w1.dtype), w2 dtype: \(w2.dtype)")
+            }
+
+            let swiftPath: String
+            if isDiffusers {
+                swiftPath = mapDiffusersPathToSwiftPath(rawPath)
+            } else if isCombinedQKVLayer(rawPath) {
+                // Keep fused BFL QKV paths intact.  They are split only after
+                // kron expansion because w2's rows are interleaved by w1.
+                swiftPath = rawPath
+            } else {
+                swiftPath = mapBFLPathToSwiftPath(rawPath)
+            }
+            lokrWeights[swiftPath] = LoKRWeightPair(
+                w1: MLXArrayWrapper(w1), w2: MLXArrayWrapper(w2))
+            totalParams += w1.size + w2.size
+        }
+
+        let targetModel = detectTargetModel(formatKeys)
+        let mappedLayers = weights.count + lokrWeights.count
         info = LoRAInfo(
-            numLayers: weights.count,
+            numLayers: mappedLayers,
             rank: rank,
             numParameters: totalParams,
-            targetModel: targetModel
-        )
+            targetModel: targetModel)
 
-        Flux2Debug.log("[LoRA] Info: \(weights.count) layers, rank=\(rank), params=\(totalParams), target=\(targetModel.rawValue)")
+        Flux2Debug.log("[LoRA] Info: \(mappedLayers) layers, rank=\(rank), params=\(totalParams), target=\(targetModel.rawValue)")
+    }
+
+    /// Strip prefixes used by PEFT/diffusers exports while retaining the
+    /// architecture-specific BFL or diffusers layer names for mapping.
+    private func normalizeLayerPath(_ path: String) -> String {
+        var layerPath = path
+        if layerPath.hasPrefix("base_model.model.") {
+            layerPath = String(layerPath.dropFirst("base_model.model.".count))
+        }
+        if layerPath.hasPrefix("transformer.") {
+            layerPath = String(layerPath.dropFirst("transformer.".count))
+        }
+        if layerPath.hasPrefix("diffusion_model.") {
+            layerPath = String(layerPath.dropFirst("diffusion_model.".count))
+        }
+        return layerPath
     }
 
     /// Check if a layer path refers to a combined QKV projection
@@ -464,9 +514,19 @@ public class LoRALoader {
         return weights[layerPath]
     }
 
-    /// Get all layer paths that have LoRA weights
+    /// Get all layer paths that have standard LoRA weights
     public var layerPaths: [String] {
         Array(weights.keys).sorted()
+    }
+
+    /// Get all layer paths that have direct LoKr factors
+    var lokrLayerPaths: [String] {
+        Array(lokrWeights.keys).sorted()
+    }
+
+    /// Get direct LoKr factors for a specific layer
+    func getLoKRWeights(for layerPath: String) -> LoKRWeightPair? {
+        lokrWeights[layerPath]
     }
 
     /// Clear LoRA weights from memory after fusion
@@ -479,11 +539,12 @@ public class LoRALoader {
     public func clearWeightsAfterFusion() {
         let memoryFreed = info?.memorySizeMB ?? 0
         weights.removeAll()
+        lokrWeights.removeAll()
         Flux2Debug.log("[LoRA] Cleared weights after fusion, freed ~\(String(format: "%.1f", memoryFreed)) MB")
     }
 
     /// Whether weights are still in memory (not yet cleared after fusion)
     public var hasWeightsInMemory: Bool {
-        !weights.isEmpty
+        !weights.isEmpty || !lokrWeights.isEmpty
     }
 }

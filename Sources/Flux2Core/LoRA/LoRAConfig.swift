@@ -134,6 +134,16 @@ public struct LoRAWeightPair: @unchecked Sendable {
     }
 }
 
+/// A direct LoKr (Kronecker-product) update as written by LyCORIS and
+/// ai-toolkit.  The full update is `kron(w1, w2)` and is deliberately not
+/// materialized while loading the adapter.
+struct LoKRWeightPair: @unchecked Sendable {
+    let w1: MLXArrayWrapper
+    let w2: MLXArrayWrapper
+
+    var rank: Int { w1.shape.first ?? 0 }
+}
+
 // Wrapper to make MLXArray Sendable-compatible
 import MLX
 

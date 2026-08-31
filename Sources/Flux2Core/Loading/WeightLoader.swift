@@ -770,16 +770,139 @@ public class Flux2WeightLoader {
 
         var dtypeLogged = false
 
+        // Merge one model weight, optionally adding already-materialized deltas
+        // (used for the three projections represented by a fused BFL QKV LoKr).
+        func mergeWeight(
+            _ originalWeight: MLXArray,
+            _ ql: QuantizedLinear?,
+            _ loraUpdates: [LoRAWeightUpdate],
+            additionalDeltas: [MLXArray] = []
+        ) -> (weight: MLXArray, scales: MLXArray?, biases: MLXArray?)? {
+            var mergedWeight: MLXArray
+            if let ql {
+                mergedWeight = dequantized(
+                    ql.weight, scales: ql.scales, biases: ql.biases,
+                    groupSize: ql.groupSize, bits: ql.bits, mode: ql.mode
+                ).asType(.float16)
+            } else {
+                mergedWeight = originalWeight
+            }
+
+            for delta in additionalDeltas {
+                guard delta.size == mergedWeight.size else {
+                    Flux2Debug.log("[LoRA] Warning: LoKr delta size \(delta.size) does not match weight size \(mergedWeight.size)")
+                    return nil
+                }
+                mergedWeight = mergedWeight + delta.asType(mergedWeight.dtype).reshaped(mergedWeight.shape)
+            }
+
+            for update in loraUpdates {
+                switch update {
+                case .lowRank(let scale, let loraA, let loraB):
+                    if !dtypeLogged {
+                        Flux2Debug.log("[LoRA] dtypes - original: \(mergedWeight.dtype), loraA: \(loraA.dtype), loraB: \(loraB.dtype)")
+                        dtypeLogged = true
+                    }
+                    let loraAConverted = loraA.asType(mergedWeight.dtype)
+                    let loraBConverted = loraB.asType(mergedWeight.dtype)
+                    let loraDelta = scale * matmul(loraBConverted, loraAConverted)
+                    guard loraDelta.shape == mergedWeight.shape else {
+                        Flux2Debug.log("[LoRA] Warning: LoRA delta shape \(loraDelta.shape) does not match weight shape \(mergedWeight.shape)")
+                        return nil
+                    }
+                    mergedWeight = mergedWeight + loraDelta
+
+                case .kronecker(let scale, let w1, let w2):
+                    guard w1.ndim == 2, w2.ndim == 2 else {
+                        Flux2Debug.log("[LoRA] Warning: only 2-D direct LoKr factors are supported (w1=\(w1.shape), w2=\(w2.shape))")
+                        return nil
+                    }
+                    if !dtypeLogged {
+                        Flux2Debug.log("[LoRA] dtypes - weight: \(mergedWeight.dtype), w1: \(w1.dtype), w2: \(w2.dtype)")
+                        dtypeLogged = true
+                    }
+                    let w1Converted = w1.asType(mergedWeight.dtype)
+                    let w2Converted = w2.asType(mergedWeight.dtype)
+                    let loraDelta = (scale * kron(w1Converted, w2Converted))
+                    guard loraDelta.size == mergedWeight.size else {
+                        Flux2Debug.log("[LoRA] Warning: LoKr delta shape \(loraDelta.shape) does not match weight shape \(mergedWeight.shape)")
+                        return nil
+                    }
+                    mergedWeight = mergedWeight + loraDelta.reshaped(mergedWeight.shape)
+                }
+            }
+
+            if let ql {
+                let (newWeight, newScales, newBiases) = quantized(
+                    mergedWeight, groupSize: ql.groupSize, bits: ql.bits, mode: ql.mode
+                )
+                return (newWeight, newScales, newBiases)
+            }
+            return (mergedWeight, nil, nil)
+        }
+
         for (_, layerPaths) in batches {
             var updates: [String: MLXArray] = [:]
 
             for layerPath in layerPaths {
-                let pairs = loraManager.getLoRAPairs(for: layerPath)
-                guard !pairs.isEmpty else { continue }
+                let loraUpdates = loraManager.getLoRAUpdates(for: layerPath)
+                guard !loraUpdates.isEmpty else { continue }
 
-                // The layer path needs ".weight" suffix to match model parameters
+                // LoKr files trained against the BFL fused QKV projection have
+                // one [3*dim, dim] Kronecker delta, while Swift stores Q, K,
+                // and V as three separate [dim, dim] parameters.  Expand once,
+                // then split in exactly the same row order as weight loading.
+                let isFusedLoKR = isCombinedBFLQKVPath(layerPath)
+                if isFusedLoKR {
+                    let kroneckerUpdates = loraUpdates.compactMap { update -> (Float, MLXArray, MLXArray)? in
+                        if case .kronecker(let scale, let w1, let w2) = update {
+                            return (scale, w1, w2)
+                        }
+                        return nil
+                    }
+                    guard !kroneckerUpdates.isEmpty else { continue }
+
+                    var fullDelta: MLXArray?
+                    for (scale, w1, w2) in kroneckerUpdates {
+                        let delta = scale * kron(w1.asType(.float16), w2.asType(.float16))
+                        fullDelta = fullDelta.map { $0 + delta } ?? delta
+                    }
+                    guard let fullDelta, fullDelta.shape.count == 2, fullDelta.shape[0] % 3 == 0 else {
+                        Flux2Debug.log("[LoRA] Warning: invalid fused LoKr QKV delta shape for \(layerPath)")
+                        continue
+                    }
+
+                    let blockIndex = extractBFLBlockIndex(from: layerPath)
+                    let targetPaths: [String]
+                    if layerPath.contains(".img_attn.qkv") {
+                        targetPaths = ["transformerBlocks.\(blockIndex).attn.toQ", "transformerBlocks.\(blockIndex).attn.toK", "transformerBlocks.\(blockIndex).attn.toV"]
+                    } else {
+                        targetPaths = ["transformerBlocks.\(blockIndex).attn.addQProj", "transformerBlocks.\(blockIndex).attn.addKProj", "transformerBlocks.\(blockIndex).attn.addVProj"]
+                    }
+                    let dim = fullDelta.shape[0] / 3
+                    for (index, targetPath) in targetPaths.enumerated() {
+                        guard let originalWeight = flatParameters[targetPath + ".weight"] else {
+                            notFoundCount += 1
+                            continue
+                        }
+                        let chunk = fullDelta[index * dim..<(index + 1) * dim, 0...]
+                        guard let merged = mergeWeight(
+                            originalWeight, quantizedModules[targetPath], [], additionalDeltas: [chunk]) else {
+                            continue
+                        }
+                        updates[targetPath + ".weight"] = merged.weight
+                        if let scales = merged.scales {
+                            updates[targetPath + ".scales"] = scales
+                        }
+                        if let biases = merged.biases {
+                            updates[targetPath + ".biases"] = biases
+                        }
+                        mergedCount += 1
+                    }
+                    continue
+                }
+
                 let weightKey = layerPath + ".weight"
-
                 guard let originalWeight = flatParameters[weightKey] else {
                     notFoundCount += 1
                     if notFoundCount <= 10 {
@@ -788,60 +911,21 @@ public class Flux2WeightLoader {
                     continue
                 }
 
-                // Check if this layer is a QuantizedLinear
-                if let ql = quantizedModules[layerPath] {
-                    // === QuantizedLinear path: dequant → merge → requant ===
-                    // 1. Dequantize (affine or fp mode; biases is nil for fp modes) → float16
-                    var mergedWeight = dequantized(
-                        ql.weight, scales: ql.scales, biases: ql.biases,
-                        groupSize: ql.groupSize, bits: ql.bits, mode: ql.mode
-                    ).asType(.float16)
-
-                    // 2. Apply all LoRA pairs
-                    for (scale, loraA, loraB) in pairs {
-                        if !dtypeLogged {
-                            Flux2Debug.log("[LoRA] dtypes - dequantized: \(mergedWeight.dtype), loraA: \(loraA.dtype), loraB: \(loraB.dtype)")
-                            dtypeLogged = true
-                        }
-                        let loraAConverted = loraA.asType(mergedWeight.dtype)
-                        let loraBConverted = loraB.asType(mergedWeight.dtype)
-                        let loraDelta = scale * matmul(loraBConverted, loraAConverted)
-                        mergedWeight = mergedWeight + loraDelta
-                    }
-
-                    // 3. Requantize with the layer's original quantization mode
-                    let (newWeight, newScales, newBiases) = quantized(
-                        mergedWeight, groupSize: ql.groupSize, bits: ql.bits, mode: ql.mode
-                    )
-
-                    // 4. Update weight, scales, and biases
-                    updates[weightKey] = newWeight
-                    updates[layerPath + ".scales"] = newScales
-                    if let nb = newBiases {
-                        updates[layerPath + ".biases"] = nb
-                    }
-                } else {
-                    // === Non-quantized path (bf16 model) ===
-                    var mergedWeight = originalWeight
-
-                    for (scale, loraA, loraB) in pairs {
-                        if !dtypeLogged {
-                            Flux2Debug.log("[LoRA] dtypes - original: \(originalWeight.dtype), loraA: \(loraA.dtype), loraB: \(loraB.dtype)")
-                            dtypeLogged = true
-                        }
-                        let loraAConverted = loraA.asType(originalWeight.dtype)
-                        let loraBConverted = loraB.asType(originalWeight.dtype)
-                        let loraDelta = scale * matmul(loraBConverted, loraAConverted)
-                        mergedWeight = mergedWeight + loraDelta
-                    }
-
-                    updates[weightKey] = mergedWeight
+                guard let merged = mergeWeight(
+                    originalWeight, quantizedModules[layerPath], loraUpdates) else {
+                    continue
                 }
-
+                updates[weightKey] = merged.weight
+                if let scales = merged.scales {
+                    updates[layerPath + ".scales"] = scales
+                }
+                if let biases = merged.biases {
+                    updates[layerPath + ".biases"] = biases
+                }
                 mergedCount += 1
             }
 
-            // Apply this batch and materialize to free intermediate arrays
+            // Apply this batch and materialize to free intermediate arrays.
             if !updates.isEmpty {
                 _ = model.update(parameters: ModuleParameters.unflattened(updates))
                 eval(model.parameters())
@@ -853,6 +937,20 @@ public class Flux2WeightLoader {
         }
 
         Flux2Debug.log("[LoRA] Merged \(mergedCount) layers (\(notFoundCount) not found)")
+    }
+
+    /// Whether a mapped path is still a BFL fused QKV path.  LoKr needs to
+    /// expand this path first because its output rows do not align with the
+    /// smaller w2 factor until the Kronecker product is formed.
+    private static func isCombinedBFLQKVPath(_ layerPath: String) -> Bool {
+        layerPath.contains(".img_attn.qkv") || layerPath.contains(".txt_attn.qkv")
+    }
+
+    /// Extract the BFL double-block index from a fused QKV path.
+    private static func extractBFLBlockIndex(from layerPath: String) -> Int {
+        guard let range = layerPath.range(of: "double_blocks.") else { return 0 }
+        let suffix = layerPath[range.upperBound...]
+        return Int(suffix.prefix(while: { $0.isNumber })) ?? 0
     }
 
     /// Groups LoRA layer paths by their block prefix for batched processing.
@@ -888,9 +986,13 @@ public class Flux2WeightLoader {
     private static func blockPrefix(for layerPath: String) -> String {
         let components = layerPath.split(separator: ".")
 
-        // Match patterns like "transformer_blocks.5" or "single_transformer_blocks.12"
+        // Match both checkpoint-style snake_case names and the Swift
+        // camelCase names, plus raw BFL paths retained for fused LoKr QKV
+        // layers.
         if components.count >= 2,
-           (components[0] == "transformer_blocks" || components[0] == "single_transformer_blocks"),
+           (components[0] == "transformer_blocks" || components[0] == "single_transformer_blocks" ||
+            components[0] == "transformerBlocks" || components[0] == "singleTransformerBlocks" ||
+            components[0] == "double_blocks" || components[0] == "single_blocks"),
            Int(components[1]) != nil
         {
             return "\(components[0]).\(components[1])"

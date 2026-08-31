@@ -327,6 +327,51 @@ final class LoRAConfigTests: XCTestCase {
 
         XCTAssertEqual(config.activationKeyword, "sks")
     }
+
+    func testLoKRAdapterLoadingAndApplication() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("flux2-lokr-\(UUID().uuidString).safetensors")
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        // A small direct LoKr fixture: kron([2, 2], [3, 2]) -> [6, 4].
+        let w1 = MLXArray([
+            Float(1), Float(2),
+            Float(3), Float(4)
+        ], [2, 2])
+        let w2 = MLXArray([
+            Float(5), Float(6),
+            Float(7), Float(8),
+            Float(9), Float(10)
+        ], [3, 2])
+        // Direct w1/w2 exports ignore alpha for normalization, matching
+        // LyCORIS/ComfyUI. Keep the key here to exercise the real file format.
+        let alpha = MLXArray([Float(4)])
+        try save(arrays: [
+            "diffusion_model.single_blocks.0.linear1.lokr_w1": w1,
+            "diffusion_model.single_blocks.0.linear1.lokr_w2": w2,
+            "diffusion_model.single_blocks.0.linear1.alpha": alpha
+        ], metadata: ["format": "pt"], url: url)
+
+        let manager = LoRAManager()
+        let info = try manager.loadLoRA(LoRAConfig(filePath: url.path))
+
+        XCTAssertEqual(info.numLayers, 1)
+        XCTAssertEqual(info.rank, 2)
+        XCTAssertEqual(manager.loadedLayerPaths, ["singleTransformerBlocks.0.attn.toQkvMlp"])
+        XCTAssertTrue(manager.hasLoRA(for: "singleTransformerBlocks.0.attn.toQkvMlp"))
+
+        let input = MLXArray([Float(1), Float(2), Float(3), Float(4)], [1, 4])
+        let base = MLXArray([Float](repeating: 0, count: 6), [1, 6])
+        let output = manager.applyLoRA(
+            baseOutput: base,
+            input: input,
+            layerPath: "singleTransformerBlocks.0.attn.toQkvMlp")
+        eval(output)
+
+        XCTAssertEqual(output.shape, [1, 6])
+        XCTAssertEqual(output[0, 0].item(Float.self), 95, accuracy: 0.001)
+        XCTAssertEqual(output[0, 5].item(Float.self), 355, accuracy: 0.001)
+    }
 }
 
 // MARK: - Scheduler Extended Tests
